@@ -23,10 +23,13 @@
 // fetch with the request fully assembled, which is why the recorded bytes are
 // exactly what crossed the network.
 //
+// Which providers get recorded: every one declared under `provider` in your
+// config, plus every one with credentials from `opencode auth login`. Setting
+// `providers` (or OPENCODE_LLM_AUDIT_PROVIDERS) replaces the auth-store half
+// with your own list. Each run writes `providers.json` naming what it covers,
+// so a run that records nothing still shows why.
+//
 // Known coverage limits, all inherent to the plugin seam:
-//   - Providers authenticated with `opencode auth login` have no `cfg.provider`
-//     entry. List them under `providers` (or OPENCODE_LLM_AUDIT_PROVIDERS) to
-//     have an entry created — note that this marks them as config-sourced.
 //   - `google-vertex` on `@ai-sdk/google-vertex` drops `options.fetch`, so
 //     those calls cannot be seen from here.
 //   - The experimental native runtime (OPENCODE_EXPERIMENTAL_NATIVE_LLM) does
@@ -159,7 +162,17 @@ export const LLMAuditPlugin: Plugin = async (_input, options) => {
   return {
     async config(cfg) {
       const providers = ((cfg.provider ??= {}) as Record<string, { options?: Record<string, unknown> }>) ?? {}
-      for (const id of new Set([...Object.keys(providers), ...settings.providers])) {
+      // Config is only half the picture: a provider set up with
+      // `opencode auth login` has credentials but no config entry, so take the
+      // ids from the auth store too. An explicit `providers` list wins over
+      // both, for anything neither source knows about.
+      const sources = {
+        config: Object.keys(providers),
+        auth: settings.providers.length > 0 ? [] : authenticated(),
+        option: settings.providers,
+      }
+      const ids = new Set([...sources.config, ...sources.auth, ...sources.option])
+      for (const id of ids) {
         const provider = (providers[id] ??= {})
         const options = (provider.options ??= {})
         if (decorated.has(options)) continue
@@ -167,6 +180,10 @@ export const LLMAuditPlugin: Plugin = async (_input, options) => {
         const upstream = typeof options["fetch"] === "function" ? (options["fetch"] as FetchLike) : undefined
         options["fetch"] = audited(id, upstream)
       }
+      // Written up front so a run that records nothing still says why: the
+      // directory exists, and this file shows which providers are covered.
+      const run = session(settings.dir)
+      if (run) manifest(run, [...ids], sources)
     },
     async "chat.params"(input) {
       // `model.providerID` rather than `provider`: the hook's declared type says
@@ -213,6 +230,32 @@ function session(base: string): Run | undefined {
   const run = open(base)
   global["__opencodeLLMAuditPluginRun"] = run ?? false
   return run
+}
+
+/**
+ * Provider ids that have credentials stored by `opencode auth login`. Only the
+ * ids are read — never the values — and any failure means "none", since this
+ * is a convenience over the explicit `providers` option.
+ */
+function authenticated(): string[] {
+  const base = process.env["XDG_DATA_HOME"] ?? path.join(os.homedir(), ".local", "share")
+  try {
+    const stored = JSON.parse(fs.readFileSync(path.join(base, "opencode", "auth.json"), "utf8"))
+    return isRecord(stored) ? Object.keys(stored) : []
+  } catch {
+    return []
+  }
+}
+
+function manifest(run: Run, providers: string[], sources: Record<string, string[]>) {
+  run.queue = run.queue
+    .then(() =>
+      fs.promises.writeFile(
+        path.join(run.dir, "providers.json"),
+        text({ recording: providers.sort(), sources, time: new Date().toISOString() }),
+      ),
+    )
+    .catch(() => undefined)
 }
 
 function persist(run: Run, turn: number, body: Record<string, unknown>) {

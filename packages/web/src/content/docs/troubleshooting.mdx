@@ -20,29 +20,6 @@ You can set the log level with the `--log-level` command-line option to get more
 
 ---
 
-## LLM audit log
-
-When you need to see exactly what opencode sends to a model — the full system prompt, the message history, the tool schemas — and exactly what the provider streams back, turn on the audit log:
-
-```bash
-OPENCODE_LLM_AUDIT=1 opencode
-```
-
-Every provider request is written to `~/.local/share/opencode/log/llm-audit/<timestamp>-<run>/`, one file per request:
-
-- `turn_001.json`, `turn_002.json`, ... — the request (method, URL, headers, body) and the response (status, headers, parsed JSON body or the stream of server-sent events), plus token usage and an estimated cost for that call.
-- `summary.json` — running totals for the process: turns, errors, token counts, elapsed time, estimated cost.
-- `latest.json` — sits one level up and points at the directory the most recent run is writing to.
-
-Other options:
-
-- `OPENCODE_LLM_AUDIT_DIR=/path/to/dir` writes somewhere else, and turns auditing on by itself.
-- `OPENCODE_LLM_AUDIT_RAW=1` also stores the undecoded response text next to the parsed events.
-
-API keys and other credentials are redacted from headers and URLs, but request and response bodies are stored verbatim — they contain your prompts, your files, and your tool output, so treat the directory as sensitive and delete it when you are done. Auditing is off by default and writes nothing until you enable it.
-
----
-
 ## Storage
 
 opencode stores session data and other application data on disk at:

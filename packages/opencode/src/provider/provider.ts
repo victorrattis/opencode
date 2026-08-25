@@ -16,7 +16,6 @@ import { Env } from "../env"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { iife } from "@/util/iife"
 import { Global } from "@opencode-ai/core/global"
-import { LLMAudit } from "@opencode-ai/core/observability/llm-audit"
 import path from "path"
 import { pathToFileURL } from "url"
 import { Effect, Layer, Context, Schema, Types } from "effect"
@@ -1794,27 +1793,11 @@ const layer = Layer.effect(
           const combined = signals.length === 0 ? null : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
           if (combined) opts.signal = combined
 
-          // Opt-in wire audit (OPENCODE_LLM_AUDIT=1). Every provider goes
-          // through this fetch, so this is the one place that sees the request
-          // exactly as it is sent and the response exactly as it comes back.
-          const audit = LLMAudit.begin({
-            input,
-            init: opts,
-            providerID: model.providerID,
-            cost: (modelID) => s.providers[model.providerID]?.models[modelID]?.cost,
-          })
-
           const res = await fetchFn(input, {
             ...opts,
             // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
             timeout: false,
-          })
-            .finally(() => headerTimeoutCtl?.clear())
-            .catch((error: unknown) => {
-              audit?.failure(error)
-              throw error
-            })
-          audit?.response(res)
+          }).finally(() => headerTimeoutCtl?.clear())
 
           if (!chunkAbortCtl) return res
           return wrapSSE(res, chunkTimeout, chunkAbortCtl)

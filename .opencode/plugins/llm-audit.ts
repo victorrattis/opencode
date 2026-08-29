@@ -1,20 +1,59 @@
 // Wire-level audit log for LLM provider traffic.
 //
-// Answers "what did opencode actually send to the model?" — the full system
-// prompt, the message history, the tool schemas — and what the provider
-// streamed back. Self-contained: drop this one file in `.opencode/plugins/`
-// (project) or `~/.config/opencode/plugins/` (global) of a stock opencode
-// install and it works. No fork, no dependencies.
+// Answers "what did opencode actually send to the model, what came back, and
+// what did it cost?" — the full system prompt, the tool schemas, every message
+// in the history, the assembled reply, and the token bill, one record per model
+// request. Self-contained: drop this one file in `.opencode/plugins/` (project)
+// or `~/.config/opencode/plugins/` (global) of a stock opencode install and it
+// works. No fork, no dependencies.
 //
 // Enable with `OPENCODE_LLM_AUDIT=1` (or point `OPENCODE_LLM_AUDIT_DIR` at a
 // directory), or from config:
 //
 //   { "plugin": [["./llm-audit.ts", { "dir": "/tmp/audit", "raw": true }]] }
 //
-// Every model request lands in `<dir>/<timestamp>-<pid>/turn_NNN.json` with the
-// request (method, URL, headers, body), the response (status, headers, parsed
-// JSON or SSE events), token usage, and an estimated cost. Running totals go to
-// `summary.json`, `run.json` records how the run was configured, and
+// A "turn" here is one HTTP request to the model. A single thing you typed
+// usually spans several turns, because each tool call round-trips again.
+//
+// Per turn, `<dir>/<timestamp>-<pid>/turn_NNN.json` holds:
+//
+//   prompt   what the harness sent, decoded out of the provider's dialect:
+//            system blocks, tool schemas and messages, each with its size, its
+//            share of the prompt, cache markers and a preview; plus the
+//            sampling settings (max_tokens, temperature, thinking, ...)
+//   reuse    the diff against the previous turn of the same session: how much
+//            of the prompt is a byte-identical prefix (cacheable) and where it
+//            first diverged — the number to watch when hunting for waste
+//   reply    the model's output assembled from the stream: text, reasoning,
+//            tool calls with arguments, stop reason
+//   usage    the token bill (see below)
+//   cost     what that bill is worth at the model's catalog price
+//   request  the verbatim bytes on the wire (method, URL, headers, body)
+//   response status, headers, parsed JSON or SSE events
+//
+// About the token counts. `usage` is normalized onto one shape across the
+// dialects, and `usage.source` says where it came from:
+//
+//   "provider"  the counts the provider billed, taken off the wire. Exact.
+//   "estimated" the provider reported nothing for this request (some
+//               OpenAI-compatible endpoints omit usage unless asked, and a
+//               Bedrock event stream is binary), so the counts are derived from
+//               the characters on the wire and are a guess.
+//
+// `input` is always the prompt tokens billed at the full rate, with cache reads
+// and cache writes kept separate, so `prompt` = input + cache_read +
+// cache_write and `total` = prompt + output. `reasoning` is reported as part of
+// `output`, never added on top of it, because that is how it is billed.
+//
+// Because the provider only gives one number for the whole prompt, the per-part
+// token counts are that number distributed across the parts in proportion to
+// their characters (largest remainder, so the parts add up to the total
+// exactly). That is exact in aggregate and approximate per row — and it is only
+// indicative for a row holding an image or audio, whose token cost has nothing
+// to do with the size of its base64; those rows are flagged `binary`.
+//
+// `turns.jsonl` is one compact line per turn for scanning or piping into jq,
+// `summary.json` keeps running totals broken down by model and by agent, and
 // `latest.json` one level up points at the current run.
 //
 // How it hooks in: it wraps the process's `fetch` and records the calls whose
@@ -34,6 +73,7 @@
 // Credentials in headers and query params are redacted; bodies are stored
 // verbatim, so treat the directory as sensitive.
 import type { Plugin, PluginOptions } from "@opencode-ai/plugin"
+import { createHash } from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -51,6 +91,57 @@ const MODEL_PATH =
 // Body keys that mean "this is a prompt", across every dialect.
 const PROMPT_KEY = /"(messages|contents|system_instruction|systemInstruction)"\s*:/
 
+// The fallback ratio, used only for the turns where the provider reports no
+// usage at all. Where it does report, the real count is distributed instead.
+const CHARS_PER_TOKEN = 4
+const PREVIEW_CHARS = 240
+
+// Turns that arrive without a session id on the wire and without a context to
+// borrow one from still have to be written somewhere.
+const NO_SESSION = "sem-sessao"
+
+// The cache breakpoint markers. A well-behaved client moves them forward as
+// the conversation grows, which changes the bytes without changing a word of
+// what the model reads — so they are stripped before fingerprinting a prompt,
+// or every turn would look like a broken prefix.
+const CACHE_MARKER = /,?"(cache_control|cachePoint)"\s*:\s*\{[^{}]*\}/g
+
+// Block types whose size on the wire says nothing about their token cost.
+const BINARY_KIND = /image|audio|video|document|file|inline_?data|blob|source/i
+
+// Sampling knobs worth auditing, across dialects. Everything else in the body
+// is either the prompt itself or plumbing.
+const SETTING_KEYS = [
+  "stream",
+  "stream_options",
+  "max_tokens",
+  "max_completion_tokens",
+  "max_output_tokens",
+  "maxTokens",
+  "temperature",
+  "top_p",
+  "top_k",
+  "topP",
+  "topK",
+  "thinking",
+  "reasoning",
+  "reasoning_effort",
+  "tool_choice",
+  "toolChoice",
+  "parallel_tool_calls",
+  "stop_sequences",
+  "stop",
+  "service_tier",
+  "generationConfig",
+  "inferenceConfig",
+  "truncation",
+  "store",
+  "metadata",
+]
+
+// Where the providers put their token counts. Cohere hangs them off `meta`.
+const USAGE_KEY = /^(usage|usage_?metadata|billed_units|token_?usage)$/i
+
 type FetchLike = typeof globalThis.fetch
 
 // Only the parts of the model this file uses. Declared locally because
@@ -62,13 +153,27 @@ type ModelInfo = {
   cost: { input: number; output: number; cache: { read: number; write: number } }
 }
 
+/**
+ * One request's token bill, normalized across the dialects.
+ *
+ * `input` excludes what was read from or written to the cache, so the four
+ * prompt-side counters never overlap and `prompt` is their sum. `reasoning` is
+ * the thinking part of `output`, not an addition to it.
+ */
 type Usage = {
   input: number
-  output: number
   cache_read: number
   cache_write: number
+  output: number
   reasoning: number
+  prompt: number
   total: number
+  source: "provider" | "estimated"
+  // Counters only some providers report: the cache TTL split, audio and
+  // prediction tokens, built-in tool requests, the provider's own total (kept
+  // as reported, to check ours against), and its own cost when it bills in
+  // dollars rather than tokens.
+  details?: Record<string, number>
 }
 
 type Settings = {
@@ -84,21 +189,171 @@ type Context = {
   model: ModelInfo
 }
 
-type Run = {
+// One decoded piece of the prompt: a system block, a tool schema, or a message.
+// Sized in characters here; tokens are attributed later, once the provider has
+// said what the whole prompt actually cost.
+type Piece = {
+  index: number
+  role?: string
+  name?: string
+  kinds?: string[]
+  chars: number
+  share?: number
+  binary?: boolean
+  description_chars?: number
+  schema_chars?: number
+  cache?: string
+  preview?: string
+  text?: string
+  // Hash of the piece with the cache markers removed, for the reuse diff.
+  stable?: string
+}
+
+type Prompt = {
+  dialect: string
+  settings: Record<string, unknown>
+  totals: {
+    chars: number
+    system_chars: number
+    tools_chars: number
+    messages_chars: number
+    tool_count: number
+    message_count: number
+  }
+  system: Piece[]
+  tools: Piece[]
+  messages: Piece[]
+}
+
+// The prompt with its tokens attributed: the JSON view, plus the per-message
+// numbers the reuse diff needs.
+type Attributed = {
+  view: Record<string, unknown>
+  perSystem: number[]
+  perTool: number[]
+  perMessage: number[]
+  system: number
+  tools: number
+  messages: number
+  total: number
+  measured: boolean
+}
+
+// What a turn looked like, kept so the next turn of the same session can be
+// diffed against it.
+type Fingerprint = {
+  turn: number
+  system: string
+  tools: string
+  messages: string[]
+  chars: number[]
+}
+
+type Reuse = {
+  previous_turn: number
+  system_changed: boolean
+  tools_changed: boolean
+  stable_messages: number
+  changed_at: number | null
+  added_messages: number
+  dropped_messages: number
+  prefix_stable: boolean
+  resent_chars: number
+  new_chars: number
+}
+
+type Reply = {
+  text: string
+  reasoning: string
+  tool_calls: { name?: string; arguments: unknown; chars: number }[]
+  stop_reason?: string
+  chars: { text: number; reasoning: number; tool_calls: number; total: number }
+}
+
+type Draft = {
+  text: string[]
+  reasoning: string[]
+  calls: Map<string, { name?: string; args: string }>
+  stop?: string
+}
+
+// The fields that identify a turn, at the head of its record.
+type Head = {
+  turn: number
+  provider: string | undefined
+  model: string | undefined
+  session: string | undefined
+  agent: string | undefined
+  started_at: string
+  elapsed_seconds: number
+}
+
+// Running totals. Kept per model and per agent as well as overall, because
+// tokens from a title model and tokens from the coding model are neither the
+// same money nor the same problem.
+type Bucket = {
+  turns: number
+  usage: Usage
+  cost: number
+  provider_cost: number
+}
+
+/**
+ * One conversation, and one folder.
+ *
+ * A process serves however many conversations you open — `/new` does not start
+ * a new process — so the folder cannot be the process if a reader is to take
+ * "one folder, one session" at face value. Everything is counted here rather
+ * than on the run: the run is just where the folders live.
+ *
+ * Subagents (the `task` tool) are sessions of their own on the wire, with their
+ * own id and a `parentID`, but they are part of the work of whoever spawned
+ * them, so their turns are filed under the root session's folder.
+ */
+type Session = {
+  id: string
   dir: string
   started: number
   turns: number
   errors: number
-  cost: number
-  usage: Usage
+  incomplete: number
+  reported: Bucket
+  estimated: Bucket
+  byModel: Map<string, Bucket>
+  byAgent: Map<string, Bucket>
+  // The reuse chains. Keeping them on the session makes diffing one
+  // conversation's prompt against another's structurally impossible.
+  history: Map<string, Fingerprint>
+  // Every session id filed under this folder: the root and its subagents.
+  members: Set<string>
+  prompt: { system: number; tools: number; messages: number; total: number }
+  resent: number
+  breaks: number
+  // Turns whose response had not landed yet. A request still in flight when the
+  // process exits would otherwise leave no trace at all.
+  pending: Map<number, Record<string, unknown>>
+}
+
+// The process: a directory holding one folder per session, and nothing else of
+// its own but the roll-up.
+type Run = {
+  dir: string
+  started: number
+  requests: number
+  sessions: Map<string, Session>
   queue: Promise<void>
 }
 
 // opencode can create more than one plugin instance per process; they all share
-// one run directory, one turn counter, and one set of session contexts.
+// one run directory and one set of session contexts.
 type State = {
   settings: Settings
+  // By session, which is how the requests identify themselves on the wire.
   contexts: Map<string, Context>
+  // By model, only for requests that do not say which session they belong to.
+  byModel: Map<string, Context>
+  // Child session -> parent, learned from `x-parent-session-id`.
+  parents: Map<string, string>
   recent?: Context
   run?: Run | false
 }
@@ -120,7 +375,8 @@ export const LLMAuditPlugin: Plugin = async (_input, options) => {
         providerID: input.model.providerID,
         model: input.model,
       }
-      state.contexts.set(context.model.id, context)
+      state.contexts.set(context.sessionID, context)
+      state.byModel.set(context.model.id, context)
       state.recent = context
     },
   }
@@ -130,7 +386,7 @@ function shared(settings: Settings): State {
   const global = globalThis as Record<string, unknown>
   const existing = global["__opencodeLLMAuditState"] as State | undefined
   if (existing) return existing
-  const state: State = { settings, contexts: new Map() }
+  const state: State = { settings, contexts: new Map(), byModel: new Map(), parents: new Map() }
   global["__opencodeLLMAuditState"] = state
   return state
 }
@@ -148,8 +404,53 @@ function install(state: State) {
   // Carries over anything the runtime hangs off fetch (Bun's `preconnect`).
   global["__opencodeLLMAuditFetch"] = true
   globalThis.fetch = Object.assign(patched, original) as FetchLike
-  const run = session(state)
-  if (run) describeRun(run, state.settings)
+  const run = runOf(state)
+  if (!run) return
+  // Written as soon as the audit arms itself, so a run that records nothing
+  // still shows that the plugin loaded and where it was pointed.
+  run.queue = run.queue
+    .then(() => fs.promises.writeFile(path.join(run.dir, "summary.json"), text(runSummary(run))))
+    .catch(() => undefined)
+  // Written synchronously: an exit handler is too late for the queue.
+  process.on("exit", () => flush(run))
+}
+
+/** Records the turns still in flight, so a turn is never silently lost. */
+function flush(run: Run) {
+  for (const sess of run.sessions.values()) {
+    if (sess.pending.size) {
+      sess.incomplete = sess.pending.size
+      for (const [turn, record] of sess.pending) {
+        try {
+          fs.writeFileSync(path.join(sess.dir, `turn_${String(turn).padStart(3, "0")}.json`), text(record))
+          fs.appendFileSync(
+            path.join(sess.dir, "turns.jsonl"),
+            JSON.stringify({
+              turn,
+              time: record["started_at"],
+              session: record["session"],
+              agent: record["agent"],
+              model: record["model"],
+              incomplete: true,
+            }) + "\n",
+          )
+        } catch {
+          // Nothing useful to do at exit.
+        }
+      }
+      sess.pending.clear()
+    }
+    try {
+      fs.writeFileSync(path.join(sess.dir, "summary.json"), text(summary(sess)))
+    } catch {
+      // Nothing useful to do at exit.
+    }
+  }
+  try {
+    fs.writeFileSync(path.join(run.dir, "summary.json"), text(runSummary(run)))
+  } catch {
+    // Nothing useful to do at exit.
+  }
 }
 
 /**
@@ -171,30 +472,121 @@ function isModelCall(request: ReturnType<typeof describeRequest>) {
 }
 
 async function capture(state: State, request: ReturnType<typeof describeRequest>, send: () => Promise<Response>) {
-  const run = session(state)
+  const run = runOf(state)
   if (!run) return send()
 
   const started = Date.now()
-  const turn = ++run.turns
+  run.requests += 1
   const model = modelOf(request)
-  const context = (model ? state.contexts.get(model) : undefined) ?? state.recent
-  const write = (extra: Record<string, unknown>, usage: Usage | undefined) => {
-    const cost = usage && context ? estimate(usage, context.model.cost) : undefined
-    if (usage) add(run.usage, usage)
-    if (cost !== undefined) run.cost += cost
-    persist(run, turn, {
+  // opencode names the session on every request it makes. Matching on that is
+  // exact; falling back to the model is a guess that goes wrong the moment two
+  // sessions share one — a `/new` while the old session still has a request in
+  // flight would file that request under the new session, and diff its prompt
+  // against a conversation it has nothing to do with.
+  const wire = headerOf(request, "x-session-id") ?? headerOf(request, "x-session-affinity")
+  const context =
+    (wire ? state.contexts.get(wire) : undefined) ?? (model ? state.byModel.get(model) : undefined) ?? state.recent
+  const sessionID = wire ?? context?.sessionID
+  const parent = headerOf(request, "x-parent-session-id")
+  if (sessionID && parent) state.parents.set(sessionID, parent)
+  // A subagent gets its own folder nowhere: it is filed with the session whose
+  // work it is doing.
+  const sess = openSession(run, rootOf(state, sessionID))
+  if (!sess) return send()
+  if (sessionID) sess.members.add(sessionID)
+  const turn = ++sess.turns
+
+  // Decoded before the request goes out, so the reuse chain follows the order
+  // the turns were sent rather than the order the responses came back.
+  const prompt = readPrompt(request.body)
+  const reuse = track(sess, turn, sessionID, context, model, prompt)
+  const sent = {
+    method: request.method,
+    url: redactUrl(request.url),
+    headers: request.headers,
+    body: request.body,
+  }
+  sess.pending.set(turn, {
+    turn,
+    provider: context?.providerID ?? hostOf(request.url),
+    model: model ?? context?.model.id,
+    session: sessionID,
+    parent_session: parent,
+    agent: context?.agent,
+    started_at: new Date(started).toISOString(),
+    incomplete: true,
+    note: "the process exited while this request was still in flight, so nothing is known about what it cost",
+    prompt: view(prompt),
+    reuse: resolveReuse(reuse, undefined),
+    request: sent,
+  })
+
+  const write = (
+    result: { response?: unknown; error?: unknown; reply?: Reply },
+    reported: Usage | undefined,
+    billed = true,
+  ) => {
+    // A turn the provider said nothing about still consumed tokens; counting it
+    // as zero would quietly understate the run, so estimate it and label it.
+    const usage = reported ?? (billed ? guess(prompt, result.reply) : undefined)
+    const tokens = attribute(prompt, usage)
+    const spend = price(usage, context)
+    const diff = resolveReuse(reuse, tokens)
+    sess.pending.delete(turn)
+    tally(sess, context, model, usage, spend, tokens, reuse)
+
+    const head: Head = {
       turn,
       provider: context?.providerID ?? hostOf(request.url),
       model: model ?? context?.model.id,
-      session: context?.sessionID,
+      session: sessionID,
       agent: context?.agent,
       started_at: new Date(started).toISOString(),
       elapsed_seconds: (Date.now() - started) / 1000,
-      request: { method: request.method, url: redactUrl(request.url), headers: request.headers, body: request.body },
-      ...extra,
-      usage,
-      estimated_cost_usd: cost === undefined ? undefined : round(cost),
-    })
+    }
+    persist(
+      run,
+      sess,
+      turn,
+      {
+        ...head,
+        parent_session: parent,
+        usage,
+        cost: spend,
+        cache_hit_rate: hitRate(usage),
+        prompt: tokens?.view ?? view(prompt),
+        reuse: diff,
+        reply: replyView(result.reply, usage),
+        request: sent,
+        response: result.response,
+        error: result.error,
+      },
+      {
+        turn,
+        time: head.started_at,
+        session: head.session,
+        agent: head.agent,
+        model: head.model,
+        source: usage?.source,
+        input_tokens: usage?.input,
+        cache_read_tokens: usage?.cache_read,
+        cache_write_tokens: usage?.cache_write,
+        prompt_tokens: usage?.prompt,
+        output_tokens: usage?.output,
+        reasoning_tokens: usage?.reasoning,
+        total_tokens: usage?.total,
+        cache_hit_rate: hitRate(usage),
+        system_tokens: tokens?.system,
+        tools_tokens: tokens?.tools,
+        messages_tokens: tokens?.messages,
+        stable_messages: reuse?.stable_messages,
+        prefix_stable: reuse?.prefix_stable,
+        stop_reason: result.reply?.stop_reason,
+        tool_calls: result.reply?.tool_calls.map((call) => call.name).filter(Boolean),
+        cost_usd: spend?.estimated_usd,
+        seconds: head.elapsed_seconds,
+      },
+    )
   }
 
   try {
@@ -210,12 +602,17 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
     const type = response.headers.get("content-type") ?? ""
     void buffer.then((value) => {
       const body = describeResponse(type, value, state.settings.raw)
-      write({ response: { status, headers, ...body } }, usageOf(body["events"] ?? body["body"]))
+      const payload = body["events"] ?? body["body"]
+      // A rejected request bought nothing. Keep whatever the provider did
+      // report, but never invent an estimate for a turn that was not served.
+      const served = status < 400
+      if (!served) sess.errors += 1
+      write({ response: { status, headers, ...body }, reply: readReply(payload) }, usageOf(payload), served)
     }, nothing)
     return response
   } catch (error) {
-    run.errors += 1
-    write({ error: describeError(error) }, undefined)
+    sess.errors += 1
+    write({ error: describeError(error) }, undefined, false)
     throw error
   }
 }
@@ -236,7 +633,7 @@ function resolve(options?: PluginOptions): Settings {
 }
 
 /** The run directory, opened once per process. */
-function session(state: State): Run | undefined {
+function runOf(state: State): Run | undefined {
   if (state.run !== undefined) return state.run || undefined
   const run = open(state.settings.dir)
   state.run = run ?? false
@@ -254,51 +651,1067 @@ function open(base: string): Run | undefined {
   } catch {
     return undefined
   }
-  return { dir, started: Date.now(), turns: 0, errors: 0, cost: 0, usage: empty(), queue: Promise.resolve() }
+  return { dir, started: Date.now(), requests: 0, sessions: new Map(), queue: Promise.resolve() }
 }
 
-// Written when the audit arms itself, so a run that records nothing still shows
-// that the plugin loaded and where it was pointed.
-function describeRun(run: Run, settings: Settings) {
-  run.queue = run.queue
-    .then(() =>
-      fs.promises.writeFile(
-        path.join(run.dir, "run.json"),
-        text({
-          time: new Date().toISOString(),
-          pid: process.pid,
-          cwd: process.cwd(),
-          records: "every model request this process sends",
-          raw: settings.raw,
-        }),
-      ),
-    )
-    .catch(() => undefined)
+/**
+ * The folder a session writes into, created the first time it sends something.
+ * The name leads with the time so that a reader sorting folder names — which is
+ * what the viewer does — gets the most recent conversation first.
+ */
+function openSession(run: Run, root: string): Session | undefined {
+  const existing = run.sessions.get(root)
+  if (existing) return existing
+  const base = `${stamp(new Date())}-${short(root)}`
+  let name = base
+  for (let i = 2; [...run.sessions.values()].some((s) => path.basename(s.dir) === name); i++) name = `${base}-${i}`
+  const dir = path.join(run.dir, name)
+  try {
+    fs.mkdirSync(dir, { recursive: true })
+  } catch {
+    return undefined
+  }
+  const created: Session = {
+    id: root,
+    dir,
+    started: Date.now(),
+    turns: 0,
+    errors: 0,
+    incomplete: 0,
+    reported: bucket(),
+    estimated: bucket(),
+    byModel: new Map(),
+    byAgent: new Map(),
+    history: new Map(),
+    members: new Set(root === NO_SESSION ? [] : [root]),
+    prompt: { system: 0, tools: 0, messages: 0, total: 0 },
+    resent: 0,
+    breaks: 0,
+    pending: new Map(),
+  }
+  run.sessions.set(root, created)
+  return created
 }
 
-function persist(run: Run, turn: number, body: Record<string, unknown>) {
+/** Walks the parent chain up to the session that owns the work. */
+function rootOf(state: State, session: string | undefined): string {
+  if (!session) return NO_SESSION
+  let current = session
+  // A subagent can spawn a subagent; the guard is against a cycle, not depth.
+  for (let step = 0; step < 8; step++) {
+    const parent = state.parents.get(current)
+    if (!parent || parent === current) break
+    current = parent
+  }
+  return current
+}
+
+function short(id: string) {
+  if (id === NO_SESSION) return NO_SESSION
+  return id.replace(/^ses_/, "").slice(0, 10) || NO_SESSION
+}
+
+function persist(
+  run: Run,
+  sess: Session,
+  turn: number,
+  body: Record<string, unknown>,
+  index: Record<string, unknown>,
+) {
+  const name = `turn_${String(turn).padStart(3, "0")}`
   run.queue = run.queue
     .then(async () => {
-      await fs.promises.writeFile(path.join(run.dir, `turn_${String(turn).padStart(3, "0")}.json`), text(body))
-      await fs.promises.writeFile(path.join(run.dir, "summary.json"), text(summary(run)))
+      await fs.promises.writeFile(path.join(sess.dir, `${name}.json`), text(body))
+      await fs.promises.appendFile(path.join(sess.dir, "turns.jsonl"), JSON.stringify(index) + "\n")
+      await fs.promises.writeFile(path.join(sess.dir, "summary.json"), text(summary(sess)))
+      await fs.promises.writeFile(path.join(run.dir, "summary.json"), text(runSummary(run)))
     })
     .catch(() => undefined)
 }
 
-function summary(run: Run) {
+// ---------------------------------------------------------------------------
+// Totals.
+// ---------------------------------------------------------------------------
+
+function tally(
+  sess: Session,
+  context: Context | undefined,
+  model: string | undefined,
+  usage: Usage | undefined,
+  spend: Spend | undefined,
+  tokens: Attributed | undefined,
+  reuse: Reuse | undefined,
+) {
+  if (tokens) {
+    sess.prompt.system += tokens.system
+    sess.prompt.tools += tokens.tools
+    sess.prompt.messages += tokens.messages
+    sess.prompt.total += tokens.total
+  }
+  if (reuse) {
+    sess.resent += resent(reuse, tokens)
+    if (!reuse.prefix_stable) sess.breaks += 1
+  }
+  if (!usage) return
+  const name = `${context?.providerID ?? "?"}/${model ?? context?.model.id ?? "?"}`
+  for (const target of [
+    usage.source === "provider" ? sess.reported : sess.estimated,
+    into(sess.byModel, name),
+    into(sess.byAgent, context?.agent ?? "?"),
+  ])
+    accumulate(target, usage, spend)
+}
+
+function accumulate(target: Bucket, usage: Usage, spend: Spend | undefined) {
+  target.turns += 1
+  add(target.usage, usage)
+  target.cost += spend?.estimated_usd ?? 0
+  target.provider_cost += spend?.provider_usd ?? 0
+}
+
+function into(map: Map<string, Bucket>, key: string) {
+  const existing = map.get(key)
+  if (existing) return existing
+  const created = bucket()
+  map.set(key, created)
+  return created
+}
+
+function bucket(): Bucket {
+  return { turns: 0, usage: zero("provider"), cost: 0, provider_cost: 0 }
+}
+
+/** What one session's folder is worth, written as its `summary.json`. */
+function summary(sess: Session) {
+  const reported = sess.reported
+  const estimated = sess.estimated
   return {
-    turns: run.turns,
-    errors: run.errors,
-    input_tokens: run.usage.input,
-    output_tokens: run.usage.output,
-    cache_read_tokens: run.usage.cache_read,
-    cache_write_tokens: run.usage.cache_write,
-    reasoning_tokens: run.usage.reasoning,
-    total_tokens: run.usage.total,
+    session: sess.id === NO_SESSION ? undefined : sess.id,
+    // The subagents filed here, when there are any: they are sessions of their
+    // own on the wire but part of this one's work.
+    sessions_included: sess.members.size > 1 ? [...sess.members] : undefined,
+    turns: sess.turns,
+    errors: sess.errors,
+    // Turns that were sent but whose response never arrived: their tokens are
+    // missing from everything below.
+    incomplete_turns: sess.incomplete || undefined,
+    // The exact bill, and — kept apart so it cannot contaminate it — what the
+    // turns the provider stayed silent about are worth at chars / 4.
+    tokens: shape(reported),
+    estimated_tokens: estimated.turns ? shape(estimated) : undefined,
+    coverage: `${reported.turns}/${reported.turns + estimated.turns} turns counted by the provider`,
+    cost_usd: round(reported.cost + estimated.cost),
+    provider_cost_usd: reported.provider_cost ? round(reported.provider_cost) : undefined,
+    // Where the prompt tokens went, summed over the run.
+    prompt_tokens_by_part: sess.prompt,
+    // Prompt the model saw again because it was an unchanged prefix: cheap when
+    // the provider caches it, paid in full when the prefix keeps breaking.
+    resent_tokens: sess.resent,
+    // Turns whose cacheable prefix changed. Every one of these is a cache miss
+    // on the whole history — the first thing to look at when costs are high.
+    prefix_breaks: sess.breaks,
+    // Both breakdowns count every turn, estimated ones included.
+    by_model: Object.fromEntries([...sess.byModel].map(([name, value]) => [name, shape(value)])),
+    by_agent: Object.fromEntries([...sess.byAgent].map(([name, value]) => [name, shape(value)])),
+    elapsed_seconds: (Date.now() - sess.started) / 1000,
+    started_at: new Date(sess.started).toISOString(),
+    path: sess.dir,
+  }
+}
+
+/**
+ * The process, as an index over the folders it opened. Everything worth
+ * counting is counted per session; this only says which sessions there were.
+ */
+function runSummary(run: Run) {
+  return {
+    started_at: new Date(run.started).toISOString(),
+    pid: process.pid,
+    cwd: process.cwd(),
+    requests: run.requests,
+    // One folder per session — that is the unit a reader groups by.
+    sessions: Object.fromEntries(
+      [...run.sessions.values()].map((sess) => [
+        path.basename(sess.dir),
+        {
+          session: sess.id === NO_SESSION ? undefined : sess.id,
+          turns: sess.turns,
+          errors: sess.errors,
+          tokens: shape(sess.reported),
+          cost_usd: round(sess.reported.cost + sess.estimated.cost),
+        },
+      ]),
+    ),
     elapsed_seconds: (Date.now() - run.started) / 1000,
-    estimated_cost_usd: round(run.cost),
     path: run.dir,
   }
+}
+
+function shape(value: Bucket) {
+  const usage = value.usage
+  return {
+    turns: value.turns,
+    input: usage.input,
+    cache_read: usage.cache_read,
+    cache_write: usage.cache_write,
+    prompt: usage.prompt,
+    output: usage.output,
+    reasoning: usage.reasoning,
+    total: usage.total,
+    cache_hit_rate: hitRate(usage),
+    cost_usd: round(value.cost),
+    provider_cost_usd: value.provider_cost ? round(value.provider_cost) : undefined,
+    details: usage.details && Object.keys(usage.details).length ? usage.details : undefined,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Usage: the token bill, normalized across the dialects.
+// ---------------------------------------------------------------------------
+
+/**
+ * Pulls the token counts out of a response payload.
+ *
+ * Providers report usage under `usage` / `usageMetadata` / `meta.billed_units`,
+ * at the top level for a single JSON response and spread across frames while
+ * streaming (Anthropic sends the input counts in `message_start` and the final
+ * output count in `message_delta`). The raw counters are merged first, keeping
+ * the largest value seen for each, and normalized once at the end — normalizing
+ * each frame on its own would misread a frame that carries a prompt total
+ * before the cached-token detail that belongs with it.
+ */
+function usageOf(payload: unknown): Usage | undefined {
+  const merged: Record<string, unknown> = {}
+  let found = false
+  const visit = (value: unknown, depth: number) => {
+    if (depth > 8 || value === null || typeof value !== "object") return
+    if (Array.isArray(value)) return value.forEach((item) => visit(item, depth + 1))
+    for (const [key, item] of Object.entries(value)) {
+      if (USAGE_KEY.test(key) && isRecord(item)) {
+        merge(merged, item)
+        found = true
+        continue
+      }
+      visit(item, depth + 1)
+    }
+  }
+  visit(payload, 0)
+  if (!found) return undefined
+  return normalize(merged)
+}
+
+function merge(target: Record<string, unknown>, source: Record<string, unknown>) {
+  for (const [key, value] of Object.entries(source)) {
+    if (typeof value === "number" && Number.isFinite(value)) target[key] = Math.max(num(target[key]), value)
+    else if (isRecord(value)) {
+      const nested = record(target[key]) ?? {}
+      merge(nested, value)
+      target[key] = nested
+    }
+  }
+}
+
+/**
+ * One shape out of every dialect.
+ *
+ * The prompt counters are the subtle part. Anthropic reports `input_tokens`
+ * already net of the cache, and names the cached tokens separately. The OpenAI
+ * dialects and Google fold the cached tokens into the prompt total and say so
+ * in a details object — so the cached part is subtracted back out, which is
+ * also why the absence of that details object is what distinguishes the two
+ * conventions. Bedrock uses the same counters under camelCase names.
+ *
+ * The output counter is the other one. Anthropic and OpenAI already count
+ * thinking inside the completion tokens; Gemini reports `thoughtsTokenCount`
+ * on the side and bills it on top of the candidates, so it is added there.
+ */
+function normalize(value: Record<string, unknown>): Usage | undefined {
+  const inputDetails = record(value["input_tokens_details"]) ?? record(value["prompt_tokens_details"]) ?? {}
+  const outputDetails = record(value["output_tokens_details"]) ?? record(value["completion_tokens_details"]) ?? {}
+  const creation = record(value["cache_creation"]) ?? {}
+
+  const inclusive = num(inputDetails["cached_tokens"]) + num(value["cachedContentTokenCount"])
+  const prompt =
+    num(value["input_tokens"]) +
+    num(value["inputTokens"]) +
+    num(value["prompt_tokens"]) +
+    num(value["promptTokenCount"])
+  const write5m = num(creation["ephemeral_5m_input_tokens"])
+  const write1h = num(creation["ephemeral_1h_input_tokens"])
+  const thoughts = num(value["thoughtsTokenCount"])
+
+  const usage: Usage = {
+    // Gemini bills the prompt its built-in tools generate on top of the prompt.
+    input: Math.max(0, prompt - inclusive) + num(value["toolUsePromptTokenCount"]),
+    cache_read: inclusive + num(value["cache_read_input_tokens"]) + num(value["cacheReadInputTokens"]),
+    cache_write: Math.max(
+      num(value["cache_creation_input_tokens"]) + num(value["cacheWriteInputTokens"]),
+      write5m + write1h,
+    ),
+    output:
+      num(value["output_tokens"]) +
+      num(value["outputTokens"]) +
+      num(value["completion_tokens"]) +
+      num(value["candidatesTokenCount"]) +
+      thoughts,
+    reasoning: num(outputDetails["reasoning_tokens"]) + num(value["reasoning_tokens"]) + thoughts,
+    prompt: 0,
+    total: 0,
+    source: "provider",
+  }
+  usage.prompt = usage.input + usage.cache_read + usage.cache_write
+  usage.total = usage.prompt + usage.output
+  if (usage.total === 0) return undefined
+
+  const details: Record<string, number> = {}
+  const note = (key: string, amount: number) => {
+    if (amount) details[key] = amount
+  }
+  // The cache TTLs are priced differently, so the split has to survive.
+  note("cache_write_5m", write5m)
+  note("cache_write_1h", write1h)
+  note("audio_input", num(inputDetails["audio_tokens"]))
+  note("audio_output", num(outputDetails["audio_tokens"]))
+  note("accepted_prediction", num(outputDetails["accepted_prediction_tokens"]))
+  note("rejected_prediction", num(outputDetails["rejected_prediction_tokens"]))
+  for (const [key, amount] of Object.entries(record(value["server_tool_use"]) ?? {})) note(key, num(amount))
+  // Kept as reported, so a disagreement with the total above is visible rather
+  // than smoothed over.
+  note(
+    "reported_total",
+    num(value["total_tokens"]) + num(value["totalTokens"]) + num(value["totalTokenCount"]),
+  )
+  // Gateways that bill in money rather than tokens (OpenRouter) report it here.
+  note("provider_cost", num(value["cost"]))
+  if (Object.keys(details).length) usage.details = details
+  return usage
+}
+
+/** The fallback for a turn the provider reported nothing about. */
+function guess(prompt: Prompt | undefined, reply: Reply | undefined): Usage | undefined {
+  if (!prompt) return undefined
+  const usage = zero("estimated")
+  usage.input = est(prompt.totals.chars)
+  usage.output = est(reply?.chars.total ?? 0)
+  usage.reasoning = est(reply?.chars.reasoning ?? 0)
+  usage.prompt = usage.input
+  usage.total = usage.prompt + usage.output
+  return usage.total ? usage : undefined
+}
+
+type Spend = {
+  estimated_usd: number
+  provider_usd?: number
+  model?: string
+  per_million?: { input: number; output: number; cache_read: number; cache_write: number }
+  note?: string
+}
+
+/**
+ * What the turn is worth at the model's catalog price. Anthropic's one-hour
+ * cache writes are billed at twice the base input rate where the catalog's
+ * `cache.write` is the five-minute price, so they are priced apart.
+ */
+function price(usage: Usage | undefined, context: Context | undefined): Spend | undefined {
+  if (!usage) return undefined
+  const provider = num(usage.details?.["provider_cost"])
+  if (!context) return provider ? { estimated_usd: round(provider), provider_usd: round(provider) } : undefined
+  const cost = context.model.cost
+  const long = num(usage.details?.["cache_write_1h"])
+  const short = Math.max(0, usage.cache_write - long)
+  const estimated =
+    (usage.input * cost.input +
+      usage.output * cost.output +
+      usage.cache_read * cost.cache.read +
+      short * cost.cache.write +
+      long * cost.input * 2) /
+    1_000_000
+  return {
+    estimated_usd: round(estimated),
+    provider_usd: provider ? round(provider) : undefined,
+    model: context.model.id,
+    per_million: {
+      input: cost.input,
+      output: cost.output,
+      cache_read: cost.cache.read,
+      cache_write: cost.cache.write,
+    },
+    note: usage.source === "estimated" ? "token counts estimated: the provider reported none" : undefined,
+  }
+}
+
+/** Share of the prompt the provider served from cache rather than reading anew. */
+function hitRate(usage: Usage | undefined) {
+  if (!usage || !usage.prompt) return undefined
+  return round(usage.cache_read / usage.prompt)
+}
+
+function add(target: Usage, value: Usage) {
+  target.input += value.input
+  target.cache_read += value.cache_read
+  target.cache_write += value.cache_write
+  target.output += value.output
+  target.reasoning += value.reasoning
+  target.prompt += value.prompt
+  target.total += value.total
+  if (!value.details) return
+  const details = target.details ?? {}
+  for (const [key, amount] of Object.entries(value.details)) {
+    if (key === "reported_total" || key === "provider_cost") continue
+    details[key] = num(details[key]) + amount
+  }
+  if (Object.keys(details).length) target.details = details
+}
+
+function zero(source: Usage["source"]): Usage {
+  return { input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, prompt: 0, total: 0, source }
+}
+
+// ---------------------------------------------------------------------------
+// Attribution: the provider's one prompt number, spread over the parts.
+// ---------------------------------------------------------------------------
+
+function attribute(prompt: Prompt | undefined, usage: Usage | undefined): Attributed | undefined {
+  if (!prompt) return undefined
+  const pieces = [...prompt.system, ...prompt.tools, ...prompt.messages]
+  const chars = pieces.map((piece) => piece.chars)
+  const billed = usage?.source === "provider" ? usage.prompt : 0
+  const measured = billed > 0 && chars.some(Boolean)
+  const tokens = distribute(measured ? billed : est(prompt.totals.chars), chars)
+
+  const cut = (from: number, count: number) => tokens.slice(from, from + count)
+  const systemTokens = cut(0, prompt.system.length)
+  const toolTokens = cut(prompt.system.length, prompt.tools.length)
+  const messageTokens = cut(prompt.system.length + prompt.tools.length, prompt.messages.length)
+  const sum = (values: number[]) => values.reduce((total, value) => total + value, 0)
+  const total = sum(tokens)
+
+  const rows = (list: Piece[], counts: number[]) =>
+    list.map((piece, index) => ({
+      ...piece,
+      tokens: counts[index],
+      // The text lives verbatim in `request.body`; repeating it here would
+      // double the size of every record.
+      text: undefined,
+      stable: undefined,
+    }))
+
+  return {
+    view: {
+      dialect: prompt.dialect,
+      settings: prompt.settings,
+      tokens: {
+        total,
+        system: sum(systemTokens),
+        tools: sum(toolTokens),
+        messages: sum(messageTokens),
+        // Exact and split proportionally, or a chars / 4 guess throughout.
+        source: measured ? "provider total, distributed by characters" : `characters / ${CHARS_PER_TOKEN}`,
+        chars_per_token: total ? round2(prompt.totals.chars / total) : undefined,
+      },
+      totals: prompt.totals,
+      system: rows(prompt.system, systemTokens),
+      tools: rows(prompt.tools, toolTokens),
+      messages: rows(prompt.messages, messageTokens),
+    },
+    perSystem: systemTokens,
+    perTool: toolTokens,
+    perMessage: messageTokens,
+    system: sum(systemTokens),
+    tools: sum(toolTokens),
+    messages: sum(messageTokens),
+    total,
+    measured,
+  }
+}
+
+/**
+ * Splits `total` across `weights` as whole tokens that still add up to `total`
+ * exactly, giving the leftover to the largest remainders.
+ */
+function distribute(total: number, weights: number[]): number[] {
+  const sum = weights.reduce((carry, weight) => carry + weight, 0)
+  if (!sum) return weights.map(() => 0)
+  const exact = weights.map((weight) => (weight * total) / sum)
+  const result = exact.map(Math.floor)
+  let left = total - result.reduce((carry, value) => carry + value, 0)
+  const order = exact
+    .map((value, index) => ({ remainder: value - Math.floor(value), index }))
+    .sort((a, b) => b.remainder - a.remainder)
+  for (const entry of order) {
+    if (left <= 0) break
+    result[entry.index] += 1
+    left -= 1
+  }
+  return result
+}
+
+/** The prompt without attribution, for the turns where there is no usage at all. */
+function view(prompt: Prompt | undefined) {
+  if (!prompt) return undefined
+  const rows = (list: Piece[]) => list.map((piece) => ({ ...piece, text: undefined, stable: undefined }))
+  return {
+    dialect: prompt.dialect,
+    settings: prompt.settings,
+    totals: prompt.totals,
+    system: rows(prompt.system),
+    tools: rows(prompt.tools),
+    messages: rows(prompt.messages),
+  }
+}
+
+/**
+ * The reply with its output tokens attributed. Reasoning is taken from the
+ * provider's own count rather than guessed; what is left over is split between
+ * the prose and the tool-call arguments by size.
+ */
+function replyView(reply: Reply | undefined, usage: Usage | undefined) {
+  if (!reply) return undefined
+  const measured = usage?.source === "provider" && usage.output > 0
+  // Providers that count thinking separately (OpenAI, Gemini) hand us the
+  // number. Anthropic folds it into `output` without breaking it out, so its
+  // share is split by size along with everything else rather than silently
+  // landing on the prose.
+  const counted = measured ? Math.min(usage.reasoning, usage.output) : 0
+  const budget = Math.max(0, measured ? usage.output - counted : est(reply.chars.total))
+  const [textTokens, reasoningTokens, callTokens] = distribute(budget, [
+    reply.chars.text,
+    counted ? 0 : reply.chars.reasoning,
+    reply.chars.tool_calls,
+  ])
+  const calls = distribute(
+    callTokens,
+    reply.tool_calls.map((call) => call.chars),
+  )
+  return {
+    stop_reason: reply.stop_reason,
+    tokens: {
+      output: counted + budget,
+      reasoning: counted + reasoningTokens,
+      text: textTokens,
+      tool_calls: callTokens,
+      source: measured ? "provider" : `characters / ${CHARS_PER_TOKEN}`,
+    },
+    chars: reply.chars,
+    text: reply.text || undefined,
+    reasoning: reply.reasoning || undefined,
+    tool_calls: reply.tool_calls.map((call, index) => ({ ...call, tokens: calls[index] })),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt: what the harness sent, decoded out of the provider's dialect.
+// ---------------------------------------------------------------------------
+
+function readPrompt(body: unknown): Prompt | undefined {
+  if (!isRecord(body)) return undefined
+  const dialect = dialectOf(body)
+  const system = systemPieces(body, dialect)
+  const tools = toolPieces(body, dialect)
+  const messages = messagePieces(body, dialect)
+
+  const sum = (pieces: Piece[]) => pieces.reduce((total, piece) => total + piece.chars, 0)
+  const systemChars = sum(system)
+  const toolsChars = sum(tools)
+  const messagesChars = sum(messages)
+  const chars = systemChars + toolsChars + messagesChars
+  for (const piece of [...system, ...tools, ...messages]) piece.share = chars ? round(piece.chars / chars) : 0
+
+  return {
+    dialect,
+    settings: settingsOf(body),
+    totals: {
+      chars,
+      system_chars: systemChars,
+      tools_chars: toolsChars,
+      messages_chars: messagesChars,
+      tool_count: tools.length,
+      message_count: messages.length,
+    },
+    system,
+    tools,
+    messages,
+  }
+}
+
+/**
+ * Which API dialect the body speaks. Checked by shape rather than by URL: the
+ * same provider is reachable through gateways and proxies that rewrite paths,
+ * but the body keys are the contract.
+ */
+function dialectOf(body: Record<string, unknown>) {
+  if ("contents" in body) return "gemini"
+  if ("toolConfig" in body || "inferenceConfig" in body || "additionalModelRequestFields" in body) return "bedrock"
+  if ("input" in body && !("messages" in body)) return "openai-responses"
+  if ("messages" in body) {
+    if ("anthropic_version" in body || "system" in body) return "anthropic"
+    const first = arrayOf(body["tools"])[0]
+    if (isRecord(first) && "input_schema" in first) return "anthropic"
+    return "openai-chat"
+  }
+  return "unknown"
+}
+
+function systemPieces(body: Record<string, unknown>, dialect: string): Piece[] {
+  if (dialect === "gemini") {
+    const instruction = record(body["systemInstruction"]) ?? record(body["system_instruction"])
+    const parts = arrayOf(instruction?.["parts"])
+    return parts.length ? parts.map((part, index) => piece(index, part)) : instruction ? [piece(0, instruction)] : []
+  }
+  if (dialect === "openai-responses") {
+    const instructions = body["instructions"]
+    return instructions ? [piece(0, instructions)] : []
+  }
+  if (dialect === "openai-chat") {
+    // OpenAI carries the system prompt as ordinary messages; lifting them out
+    // keeps the system/tools/messages split comparable across dialects.
+    return arrayOf(body["messages"])
+      .filter((message) => isSystemRole(record(message)?.["role"]))
+      .map((message, index) => piece(index, record(message)?.["content"] ?? message))
+  }
+  const system = body["system"]
+  if (typeof system === "string") return system ? [piece(0, system)] : []
+  return arrayOf(system).map((block, index) => piece(index, block))
+}
+
+function toolPieces(body: Record<string, unknown>, dialect: string): Piece[] {
+  return toolList(body, dialect).map((tool, index) => {
+    const spec = record(tool) ?? {}
+    const schema = spec["input_schema"] ?? spec["parameters"] ?? spec["inputSchema"] ?? spec["parametersJsonSchema"]
+    const serial = safeStringify(tool)
+    return {
+      index,
+      name: str(spec["name"]) ?? str(spec["type"]),
+      chars: serial.length,
+      description_chars: sizeOf(spec["description"]),
+      schema_chars: sizeOf(schema),
+      cache: cacheOf(serial),
+      preview: preview(str(spec["description"]) ?? serial),
+      text: str(spec["description"]),
+      stable: stamped(serial),
+    }
+  })
+}
+
+function toolList(body: Record<string, unknown>, dialect: string): unknown[] {
+  if (dialect === "bedrock")
+    return arrayOf(record(body["toolConfig"])?.["tools"]).map((tool) => record(tool)?.["toolSpec"] ?? tool)
+  const tools = arrayOf(body["tools"])
+  if (dialect === "gemini") {
+    const declarations: unknown[] = []
+    for (const tool of tools) {
+      const list = record(tool)?.["functionDeclarations"] ?? record(tool)?.["function_declarations"]
+      if (Array.isArray(list)) declarations.push(...list)
+      else declarations.push(tool)
+    }
+    return declarations
+  }
+  // OpenAI nests the schema under `function`; flatten so every dialect reads
+  // the same downstream.
+  return tools.map((tool) => (isRecord(tool) && isRecord(tool["function"]) ? tool["function"] : tool))
+}
+
+function messagePieces(body: Record<string, unknown>, dialect: string): Piece[] {
+  const list =
+    dialect === "gemini"
+      ? arrayOf(body["contents"])
+      : dialect === "openai-responses"
+        ? arrayOf(body["input"])
+        : arrayOf(body["messages"])
+
+  const pieces: Piece[] = []
+  for (const message of list) {
+    const value = record(message)
+    const role = str(value?.["role"]) ?? str(value?.["type"]) ?? "message"
+    if (dialect === "openai-chat" && isSystemRole(role)) continue
+    // Gemini keeps parts under `parts`; the Responses API has bare items with
+    // no content wrapper at all, so fall back to the item itself.
+    const content = value ? (value["content"] ?? value["parts"] ?? value) : message
+    const serial = safeStringify(message)
+    const body = textOf(content)
+    const kinds = kindsOf(content)
+    pieces.push({
+      index: pieces.length,
+      role,
+      kinds,
+      chars: serial.length,
+      binary: kinds.some((kind) => BINARY_KIND.test(kind)) || undefined,
+      cache: cacheOf(serial),
+      preview: preview(body),
+      text: body || undefined,
+      stable: stamped(serial),
+    })
+  }
+  return pieces
+}
+
+function settingsOf(body: Record<string, unknown>) {
+  const settings: Record<string, unknown> = {}
+  for (const key of SETTING_KEYS) if (key in body) settings[key] = body[key]
+  return settings
+}
+
+function piece(index: number, value: unknown, extra: Partial<Piece> = {}): Piece {
+  const serial = typeof value === "string" ? value : safeStringify(value)
+  const body = textOf(value) || (typeof value === "string" ? value : "")
+  return {
+    index,
+    chars: serial.length,
+    cache: cacheOf(serial),
+    ...extra,
+    preview: preview(body || serial),
+    text: body || undefined,
+    stable: stamped(serial),
+  }
+}
+
+/** The block types inside a message: text, tool_use, tool_result, image, ... */
+function kindsOf(content: unknown): string[] {
+  if (typeof content === "string") return ["text"]
+  const kinds = new Set<string>()
+  const collect = (part: unknown) => {
+    if (typeof part === "string") {
+      kinds.add("text")
+      return
+    }
+    const value = record(part)
+    if (!value) return
+    const type = str(value["type"])
+    if (type) {
+      kinds.add(type)
+      return
+    }
+    // Gemini and Bedrock name the block by its key rather than a `type` field.
+    for (const key of Object.keys(value)) if (key !== "role") kinds.add(key)
+  }
+  if (Array.isArray(content)) content.forEach(collect)
+  else collect(content)
+  return [...kinds]
+}
+
+// Keys that hold something a human would read, plus the ones that hold tool
+// arguments — those are JSON, but they are part of what the model was sent.
+const TEXT_KEYS = ["text", "thinking", "reasoning", "content", "parts", "output", "result", "response", "summary"]
+const CODE_KEYS = ["input", "arguments", "args", "functionCall", "functionResponse", "toolUse", "toolResult"]
+
+function textOf(value: unknown, depth = 0): string {
+  if (typeof value === "string") return value
+  if (depth > 8 || value === null || typeof value !== "object") return ""
+  if (Array.isArray(value))
+    return value
+      .map((item) => textOf(item, depth + 1))
+      .filter(Boolean)
+      .join("\n")
+  const entry = record(value)
+  if (!entry) return ""
+  const parts: string[] = []
+  for (const key of TEXT_KEYS) if (key in entry) parts.push(textOf(entry[key], depth + 1))
+  for (const key of CODE_KEYS) if (key in entry) parts.push(safeStringify(entry[key]))
+  return parts.filter(Boolean).join("\n")
+}
+
+function stamped(serial: string) {
+  return hash(serial.replace(CACHE_MARKER, ""))
+}
+
+function cacheOf(serial: string) {
+  const match = /"cache_control"\s*:\s*\{\s*"type"\s*:\s*"([^"]+)"/.exec(serial)
+  if (match) return match[1]
+  if (serial.includes('"cachePoint"')) return "point"
+  return undefined
+}
+
+function isSystemRole(role: unknown) {
+  return role === "system" || role === "developer"
+}
+
+// ---------------------------------------------------------------------------
+// Reuse: how much of this prompt is the previous prompt, byte for byte.
+// ---------------------------------------------------------------------------
+
+function track(
+  sess: Session,
+  turn: number,
+  sessionID: string | undefined,
+  context: Context | undefined,
+  model: string | undefined,
+  prompt: Prompt | undefined,
+): Reuse | undefined {
+  if (!prompt) return undefined
+  // The chains live on the session, so two conversations can never be diffed
+  // against each other. Within one folder there is still a chain per session id
+  // — a subagent files here but is its own conversation — and per model and
+  // dialect, so a small model called for titles does not read as a break.
+  const key = [sessionID ?? "?", model ?? context?.model.id ?? "", prompt.dialect]
+  const next: Fingerprint = {
+    turn,
+    system: hash(prompt.system.map((piece) => piece.stable).join("\n")),
+    tools: hash(prompt.tools.map((piece) => piece.stable).join("\n")),
+    messages: prompt.messages.map((piece) => piece.stable ?? ""),
+    chars: prompt.messages.map((piece) => piece.chars),
+  }
+  const previous = sess.history.get(key.join("|"))
+  sess.history.set(key.join("|"), next)
+  if (!previous) return undefined
+  return compare(previous, next)
+}
+
+function compare(previous: Fingerprint, next: Fingerprint): Reuse {
+  let stable = 0
+  while (
+    stable < previous.messages.length &&
+    stable < next.messages.length &&
+    previous.messages[stable] === next.messages[stable]
+  )
+    stable++
+  const sum = (values: number[]) => values.reduce((total, value) => total + value, 0)
+  const systemChanged = previous.system !== next.system
+  const toolsChanged = previous.tools !== next.tools
+  return {
+    previous_turn: previous.turn,
+    system_changed: systemChanged,
+    tools_changed: toolsChanged,
+    stable_messages: stable,
+    changed_at: stable < previous.messages.length ? stable : null,
+    added_messages: next.messages.length - stable,
+    dropped_messages: Math.max(0, previous.messages.length - stable),
+    // True when this turn only appended: everything the provider could have
+    // cached is still there, unchanged, in the same order.
+    prefix_stable: !systemChanged && !toolsChanged && stable >= previous.messages.length,
+    resent_chars: sum(next.chars.slice(0, stable)),
+    new_chars: sum(next.chars.slice(stable)),
+  }
+}
+
+/** The reuse diff priced in tokens, once the turn's tokens are known. */
+function resolveReuse(reuse: Reuse | undefined, tokens: Attributed | undefined) {
+  if (!reuse) return undefined
+  return {
+    ...reuse,
+    resent_tokens: resent(reuse, tokens),
+    new_tokens: tokens
+      ? tokens.perMessage.slice(reuse.stable_messages).reduce((total, value) => total + value, 0)
+      : est(reuse.new_chars),
+  }
+}
+
+function resent(reuse: Reuse, tokens: Attributed | undefined) {
+  if (!tokens) return est(reuse.resent_chars)
+  return tokens.perMessage.slice(0, reuse.stable_messages).reduce((total, value) => total + value, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Reply: the model's output, reassembled from the stream.
+// ---------------------------------------------------------------------------
+
+function readReply(payload: unknown): Reply | undefined {
+  if (payload === undefined || payload === null || typeof payload === "string") return undefined
+  const draft: Draft = { text: [], reasoning: [], calls: new Map() }
+  if (Array.isArray(payload)) payload.forEach((event) => absorb(draft, event))
+  else absorb(draft, payload)
+
+  const text = draft.text.join("")
+  const reasoning = draft.reasoning.join("")
+  const calls = [...draft.calls.values()].filter((call) => call.name || call.args)
+  if (!text && !reasoning && calls.length === 0 && !draft.stop) return undefined
+  const callChars = calls.reduce((total, call) => total + call.args.length, 0)
+  return {
+    text,
+    reasoning,
+    tool_calls: calls.map((call) => ({ name: call.name, arguments: json(call.args), chars: call.args.length })),
+    stop_reason: draft.stop,
+    chars: {
+      text: text.length,
+      reasoning: reasoning.length,
+      tool_calls: callChars,
+      total: text.length + reasoning.length + callChars,
+    },
+  }
+}
+
+/**
+ * Folds one payload into the draft. Handles the streaming frames and the
+ * single-shot bodies of every dialect in one place, because they overlap: the
+ * same block shapes show up in `content_block_start`, in a non-streaming
+ * `content` array, and in a Responses `output` item.
+ */
+function absorb(draft: Draft, event: unknown) {
+  const value = record(event)
+  if (!value) return
+  const type = str(value["type"]) ?? ""
+
+  // Anthropic streaming.
+  if (type === "content_block_start") {
+    absorbBlock(draft, key(value["index"]), record(value["content_block"]))
+    return
+  }
+  if (type === "content_block_delta") {
+    const delta = record(value["delta"]) ?? {}
+    push(draft.text, delta["text"])
+    push(draft.reasoning, delta["thinking"])
+    if (typeof delta["partial_json"] === "string") call(draft, key(value["index"])).args += delta["partial_json"]
+    return
+  }
+  if (type === "message_start") {
+    absorb(draft, value["message"])
+    return
+  }
+  if (type === "message_delta") {
+    draft.stop = str(record(value["delta"])?.["stop_reason"]) ?? draft.stop
+    return
+  }
+
+  // OpenAI Responses streaming. Only the deltas are folded in; the terminal
+  // `response.completed` frame repeats the whole output and would double it.
+  if (type.startsWith("response.")) {
+    if (type.endsWith(".delta") && typeof value["delta"] === "string") {
+      const delta = value["delta"]
+      if (type.includes("function_call_arguments"))
+        call(draft, key(value["output_index"] ?? value["item_id"])).args += delta
+      else if (type.includes("reasoning")) draft.reasoning.push(delta)
+      else draft.text.push(delta)
+      return
+    }
+    if (type === "response.output_item.added" || type === "response.output_item.done") {
+      // Message and reasoning items repeat text that already arrived as deltas;
+      // only the function call is worth picking up, for its name.
+      const item = record(value["item"])
+      if (str(item?.["type"])?.includes("function_call")) absorbBlock(draft, key(value["output_index"]), item)
+      return
+    }
+    if (type === "response.completed" || type === "response.incomplete" || type === "response.failed") {
+      const response = record(value["response"])
+      draft.stop = str(response?.["status"]) ?? draft.stop
+      return
+    }
+    return
+  }
+
+  // OpenAI chat completions, streamed or not.
+  const choices = arrayOf(value["choices"])
+  if (choices.length) {
+    for (const choice of choices) {
+      const entry = record(choice)
+      if (!entry) continue
+      draft.stop = str(entry["finish_reason"]) ?? draft.stop
+      const message = record(entry["delta"]) ?? record(entry["message"])
+      if (!message) continue
+      push(draft.text, message["content"])
+      if (Array.isArray(message["content"]))
+        for (const part of message["content"]) absorbBlock(draft, "0", record(part))
+      push(draft.reasoning, message["reasoning_content"] ?? message["reasoning"])
+      arrayOf(message["tool_calls"]).forEach((item, position) => {
+        const use = record(item)
+        if (!use) return
+        const target = call(draft, key(use["id"] ?? use["index"] ?? position))
+        const fn = record(use["function"]) ?? use
+        target.name = str(fn["name"]) ?? target.name
+        if (typeof fn["arguments"] === "string") target.args += fn["arguments"]
+      })
+    }
+    return
+  }
+
+  // Gemini, streamed or not.
+  const candidates = arrayOf(value["candidates"])
+  if (candidates.length) {
+    for (const candidate of candidates) {
+      const entry = record(candidate)
+      if (!entry) continue
+      draft.stop = str(entry["finishReason"]) ?? draft.stop
+      arrayOf(record(entry["content"])?.["parts"]).forEach((part, position) => {
+        const item = record(part)
+        if (!item) return
+        // Gemini marks reasoning by flagging an ordinary text part.
+        if (typeof item["text"] === "string")
+          push(item["thought"] === true ? draft.reasoning : draft.text, item["text"])
+        const fn = record(item["functionCall"]) ?? record(item["function_call"])
+        if (fn) {
+          const target = call(draft, key(str(fn["name"]) ?? position))
+          target.name = str(fn["name"]) ?? target.name
+          target.args = safeStringify(fn["args"] ?? fn["arguments"] ?? {})
+        }
+      })
+    }
+    return
+  }
+
+  // Anthropic non-streaming, and Bedrock Converse.
+  if (Array.isArray(value["content"])) {
+    value["content"].forEach((block, position) => absorbBlock(draft, key(position), record(block)))
+    draft.stop = str(value["stop_reason"]) ?? draft.stop
+    return
+  }
+  if (Array.isArray(value["output"])) {
+    value["output"].forEach((item, position) => absorbBlock(draft, key(position), record(item)))
+    draft.stop = str(value["status"]) ?? draft.stop
+    return
+  }
+  const output = record(value["output"])
+  if (output) {
+    absorb(draft, output["message"] ?? output)
+    draft.stop = str(value["stopReason"]) ?? draft.stop
+  }
+}
+
+function absorbBlock(draft: Draft, id: string, block: Record<string, unknown> | undefined) {
+  if (!block) return
+  const type = str(block["type"]) ?? ""
+  if (type === "text" || type === "output_text" || type === "input_text") {
+    push(draft.text, block["text"])
+    return
+  }
+  if (type === "thinking" || type === "reasoning" || type === "reasoning_content") {
+    push(draft.reasoning, block["thinking"] ?? block["text"])
+    for (const item of arrayOf(block["summary"]).concat(arrayOf(block["content"])))
+      push(draft.reasoning, record(item)?.["text"])
+    return
+  }
+  if (type === "redacted_thinking") {
+    push(draft.reasoning, REDACTED)
+    return
+  }
+  if (type === "tool_use" || type === "server_tool_use" || type === "function_call") {
+    // Keyed by position, never by the block's own id: the frames that carry the
+    // arguments identify the call by its index in the stream.
+    const target = call(draft, id)
+    target.name = str(block["name"]) ?? target.name
+    const input = block["input"] ?? block["arguments"]
+    // While streaming, the opening frame carries empty arguments and the real
+    // ones arrive as deltas, so never overwrite what is already there.
+    if (typeof input === "string") {
+      if (input && !target.args) target.args = input
+    } else if (isRecord(input) && Object.keys(input).length) target.args = safeStringify(input)
+    return
+  }
+  if (type === "message") {
+    for (const part of arrayOf(block["content"])) absorbBlock(draft, id, record(part))
+    return
+  }
+  // Bedrock blocks have no `type`; the key is the type.
+  if (!type) {
+    push(draft.text, block["text"])
+    const use = record(block["toolUse"])
+    if (use) absorbBlock(draft, id, { type: "tool_use", ...use })
+    const reasoning = record(block["reasoningContent"])
+    if (reasoning) push(draft.reasoning, textOf(reasoning))
+  }
+}
+
+function call(draft: Draft, id: string) {
+  const existing = draft.calls.get(id)
+  if (existing) return existing
+  const created: { name?: string; args: string } = { args: "" }
+  draft.calls.set(id, created)
+  return created
+}
+
+function push(target: string[], value: unknown) {
+  if (typeof value === "string" && value) target.push(value)
+}
+
+function key(value: unknown) {
+  return typeof value === "string" || typeof value === "number" ? String(value) : "0"
 }
 
 function describeRequest(input: unknown, init: { method?: string; headers?: unknown; body?: unknown } | undefined) {
@@ -343,85 +1756,6 @@ function sse(body: string) {
   return events
 }
 
-/**
- * Pulls token counts out of a response payload. Providers report usage under
- * `usage` / `usageMetadata`, at the top level for a single JSON response and
- * spread across frames while streaming (Anthropic sends input counts in
- * `message_start` and the final output count in `message_delta`), so walk the
- * payload and keep the largest value seen for each counter.
- */
-function usageOf(payload: unknown): Usage | undefined {
-  const result = empty()
-  let found = false
-  const visit = (value: unknown, depth: number) => {
-    if (depth > 8 || value === null || typeof value !== "object") return
-    if (Array.isArray(value)) return value.forEach((item) => visit(item, depth + 1))
-    for (const [key, item] of Object.entries(value)) {
-      if ((key === "usage" || key === "usageMetadata") && isRecord(item)) {
-        const usage = normalize(item)
-        if (usage) {
-          found = true
-          result.input = Math.max(result.input, usage.input)
-          result.output = Math.max(result.output, usage.output)
-          result.cache_read = Math.max(result.cache_read, usage.cache_read)
-          result.cache_write = Math.max(result.cache_write, usage.cache_write)
-          result.reasoning = Math.max(result.reasoning, usage.reasoning)
-        }
-        continue
-      }
-      visit(item, depth + 1)
-    }
-  }
-  visit(payload, 0)
-  if (!found) return undefined
-  result.total = result.input + result.output + result.cache_read + result.cache_write
-  return result
-}
-
-// Normalizes the provider dialects onto one shape. `input` is always non-cached
-// input tokens: Anthropic reports `input_tokens` that way already, while OpenAI
-// and Google fold cache reads into the prompt count.
-function normalize(value: Record<string, unknown>): Usage | undefined {
-  const inputDetails = record(value["input_tokens_details"]) ?? record(value["prompt_tokens_details"]) ?? {}
-  const outputDetails = record(value["output_tokens_details"]) ?? record(value["completion_tokens_details"]) ?? {}
-
-  const inclusive = num(inputDetails["cached_tokens"]) + num(value["cachedContentTokenCount"])
-  const prompt = num(value["input_tokens"]) + num(value["prompt_tokens"]) + num(value["promptTokenCount"])
-  const usage: Usage = {
-    input: Math.max(0, prompt - inclusive),
-    output: num(value["output_tokens"]) + num(value["completion_tokens"]) + num(value["candidatesTokenCount"]),
-    cache_read: inclusive + num(value["cache_read_input_tokens"]),
-    cache_write: num(value["cache_creation_input_tokens"]),
-    reasoning: num(outputDetails["reasoning_tokens"]) + num(value["thoughtsTokenCount"]),
-    total: 0,
-  }
-  if (usage.input + usage.output + usage.cache_read + usage.cache_write + usage.reasoning === 0) return undefined
-  return usage
-}
-
-function estimate(usage: Usage, cost: ModelInfo["cost"]) {
-  return (
-    (usage.input * cost.input +
-      usage.output * cost.output +
-      usage.cache_read * cost.cache.read +
-      usage.cache_write * cost.cache.write) /
-    1_000_000
-  )
-}
-
-function add(target: Usage, value: Usage) {
-  target.input += value.input
-  target.output += value.output
-  target.cache_read += value.cache_read
-  target.cache_write += value.cache_write
-  target.reasoning += value.reasoning
-  target.total += value.total
-}
-
-function empty(): Usage {
-  return { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0, total: 0 }
-}
-
 // Anthropic and the OpenAI dialects name the model in the body; Gemini and
 // Bedrock put it in the path.
 function modelOf(request: { url: string; body: unknown }) {
@@ -450,6 +1784,12 @@ function methodOf(input: unknown) {
 
 function headersOf(input: unknown) {
   return isRecord(input) ? input["headers"] : undefined
+}
+
+/** Um header da requisição, se ele sobreviveu à redação. */
+function headerOf(request: { headers: Record<string, string> }, name: string) {
+  const value = request.headers[name]
+  return value && value !== REDACTED ? value : undefined
 }
 
 function pathOf(url: string) {
@@ -494,6 +1834,33 @@ function text(value: unknown) {
   return JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? String(item) : item), 2) + "\n"
 }
 
+function safeStringify(value: unknown) {
+  if (typeof value === "string") return value
+  try {
+    return JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? String(item) : item)) ?? ""
+  } catch {
+    return "<unserializable>"
+  }
+}
+
+function sizeOf(value: unknown) {
+  return typeof value === "string" ? value.length : value === undefined ? 0 : safeStringify(value).length
+}
+
+function est(chars: number) {
+  return Math.round(chars / CHARS_PER_TOKEN)
+}
+
+function preview(value: string) {
+  if (!value) return undefined
+  const flat = value.replace(/\s+/g, " ").trim()
+  return flat.length > PREVIEW_CHARS ? flat.slice(0, PREVIEW_CHARS) + "…" : flat
+}
+
+function hash(value: string) {
+  return createHash("sha1").update(value).digest("hex").slice(0, 16)
+}
+
 function stamp(date: Date) {
   const pad = (value: number) => String(value).padStart(2, "0")
   return [
@@ -516,6 +1883,10 @@ function round(value: number) {
   return Math.round(value * 1_000_000) / 1_000_000
 }
 
+function round2(value: number) {
+  return Math.round(value * 100) / 100
+}
+
 function num(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : 0
 }
@@ -526,6 +1897,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function record(value: unknown) {
   return isRecord(value) ? value : undefined
+}
+
+function arrayOf(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : []
+}
+
+function str(value: unknown) {
+  return typeof value === "string" && value ? value : undefined
 }
 
 function nothing() {

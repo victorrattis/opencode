@@ -15,7 +15,23 @@
 // A "turn" here is one HTTP request to the model. A single thing you typed
 // usually spans several turns, because each tool call round-trips again.
 //
-// Per turn, `<dir>/<timestamp>-<pid>/turn_NNN.json` holds:
+// The directory is organized by conversation, not by process: one folder per
+// session, reopened whenever you come back to that session, so everything a
+// conversation ever sent stays in one place however often you resume it.
+//
+//   <dir>/<timestamp>-<session>/        one conversation, from its first turn
+//   <dir>/runs/<timestamp>-<pid>.json   what one process did, as an index
+//   <dir>/latest.json                   where the current process is writing
+//
+// A subagent (the `task` tool) is a session of its own on the wire, with its own
+// id, but its turns are the work of whoever spawned it, so they are written to
+// that conversation's folder — numbered in the same sequence, in the order they
+// were actually sent. Each turn says which session it came from (`session`), who
+// spawned it (`parent_session`) and whose folder it is in (`root_session`), and
+// `summary.json` breaks the totals down `by_session` so what a subagent cost is
+// a number you can read off.
+//
+// Per turn, `<dir>/<timestamp>-<session>/turn_NNN.json` holds:
 //
 //   prompt   what the harness sent, decoded out of the provider's dialect:
 //            system blocks, tool schemas and messages, each with its size, its
@@ -53,7 +69,10 @@
 // to do with the size of its base64; those rows are flagged `binary`.
 //
 // `turns.jsonl` is one compact line per turn for scanning or piping into jq,
-// `summary.json` keeps running totals broken down by model and by agent, and
+// `summary.json` keeps running totals broken down by model and by agent —
+// cumulative over every run that wrote to the folder — and `state.json` is what
+// the next run reads to pick the conversation up where it left off: the turn
+// counter, the totals, and the prompt fingerprints the reuse diff needs.
 // `latest.json` one level up points at the current run.
 //
 // How it hooks in: it wraps the process's `fetch` and records the calls whose
@@ -302,9 +321,11 @@ type Bucket = {
  * One conversation, and one folder.
  *
  * A process serves however many conversations you open — `/new` does not start
- * a new process — so the folder cannot be the process if a reader is to take
- * "one folder, one session" at face value. Everything is counted here rather
- * than on the run: the run is just where the folders live.
+ * a new process — and one conversation outlives however many processes, since
+ * resuming it starts a new one. So the folder is neither: it belongs to the
+ * session, is found again by id when the session is resumed, and keeps its turn
+ * numbering and its totals across every run that writes to it. Everything is
+ * counted here rather than on the run, which only indexes what it touched.
  *
  * Subagents (the `task` tool) are sessions of their own on the wire, with their
  * own id and a `parentID`, but they are part of the work of whoever spawned
@@ -321,23 +342,55 @@ type Session = {
   estimated: Bucket
   byModel: Map<string, Bucket>
   byAgent: Map<string, Bucket>
+  // Per session id filed here, so what a subagent cost is a number and not an
+  // inference from the agent breakdown.
+  bySession: Map<string, Bucket>
   // The reuse chains. Keeping them on the session makes diffing one
   // conversation's prompt against another's structurally impossible.
   history: Map<string, Fingerprint>
   // Every session id filed under this folder: the root and its subagents.
   members: Set<string>
+  // Child -> parent among them, kept so the chain survives a restart: the wire
+  // only ever names the immediate parent.
+  parents: Map<string, string>
   prompt: { system: number; tools: number; messages: number; total: number }
   resent: number
   breaks: number
   // Turns whose response had not landed yet. A request still in flight when the
   // process exits would otherwise leave no trace at all.
   pending: Map<number, Record<string, unknown>>
+  // The runs that have written here, oldest first. More than one means the
+  // conversation was resumed.
+  runs: string[]
 }
 
-// The process: a directory holding one folder per session, and nothing else of
-// its own but the roll-up.
+/** A session's folder as the previous run left it, read back from `state.json`. */
+type Saved = {
+  session: string
+  started: number
+  turns: number
+  errors: number
+  incomplete: number
+  reported: Bucket
+  estimated: Bucket
+  byModel: Map<string, Bucket>
+  byAgent: Map<string, Bucket>
+  bySession: Map<string, Bucket>
+  history: Map<string, Fingerprint>
+  members: Set<string>
+  parents: Map<string, string>
+  prompt: Session["prompt"]
+  resent: number
+  breaks: number
+  runs: string[]
+}
+
+// The process. It owns no folder of its own: the folders belong to the
+// conversations, which outlive it. All it keeps is the roll-up it writes to
+// `runs/`, saying which sessions it touched and where they live.
 type Run = {
-  dir: string
+  base: string
+  file: string
   started: number
   requests: number
   sessions: Map<string, Session>
@@ -345,7 +398,7 @@ type Run = {
 }
 
 // opencode can create more than one plugin instance per process; they all share
-// one run directory and one set of session contexts.
+// one run and one set of session contexts.
 type State = {
   settings: Settings
   // By session, which is how the requests identify themselves on the wire.
@@ -409,7 +462,7 @@ function install(state: State) {
   // Written as soon as the audit arms itself, so a run that records nothing
   // still shows that the plugin loaded and where it was pointed.
   run.queue = run.queue
-    .then(() => fs.promises.writeFile(path.join(run.dir, "summary.json"), text(runSummary(run))))
+    .then(() => fs.promises.writeFile(run.file, text(runSummary(run))))
     .catch(() => undefined)
   // Written synchronously: an exit handler is too late for the queue.
   process.on("exit", () => flush(run))
@@ -417,18 +470,20 @@ function install(state: State) {
 
 /** Records the turns still in flight, so a turn is never silently lost. */
 function flush(run: Run) {
-  for (const sess of run.sessions.values()) {
+  for (const sess of folders(run)) {
     if (sess.pending.size) {
       sess.incomplete = sess.pending.size
       for (const [turn, record] of sess.pending) {
         try {
-          fs.writeFileSync(path.join(sess.dir, `turn_${String(turn).padStart(3, "0")}.json`), text(record))
+          fs.writeFileSync(turnPath(sess, turn), text(record))
           fs.appendFileSync(
             path.join(sess.dir, "turns.jsonl"),
             JSON.stringify({
               turn,
               time: record["started_at"],
               session: record["session"],
+              parent_session: record["parent_session"],
+              root_session: record["root_session"],
               agent: record["agent"],
               model: record["model"],
               incomplete: true,
@@ -442,12 +497,15 @@ function flush(run: Run) {
     }
     try {
       fs.writeFileSync(path.join(sess.dir, "summary.json"), text(summary(sess)))
+      // Last, and always: without it the next run would not find this folder,
+      // and would start the conversation over in a new one.
+      fs.writeFileSync(path.join(sess.dir, "state.json"), text(checkpoint(sess)))
     } catch {
       // Nothing useful to do at exit.
     }
   }
   try {
-    fs.writeFileSync(path.join(run.dir, "summary.json"), text(runSummary(run)))
+    fs.writeFileSync(run.file, text(runSummary(run)))
   } catch {
     // Nothing useful to do at exit.
   }
@@ -483,17 +541,30 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
   // sessions share one — a `/new` while the old session still has a request in
   // flight would file that request under the new session, and diff its prompt
   // against a conversation it has nothing to do with.
-  const wire = headerOf(request, "x-session-id") ?? headerOf(request, "x-session-affinity")
+  // `x-opencode-session` because the opencode-hosted providers name the session
+  // under that header instead of `X-Session-Id` (see `session/llm/request.ts`);
+  // without it their traffic would fall through to the guesses below.
+  const wire =
+    headerOf(request, "x-session-id") ??
+    headerOf(request, "x-session-affinity") ??
+    headerOf(request, "x-opencode-session")
   const context =
     (wire ? state.contexts.get(wire) : undefined) ?? (model ? state.byModel.get(model) : undefined) ?? state.recent
-  const sessionID = wire ?? context?.sessionID
   const parent = headerOf(request, "x-parent-session-id")
-  if (sessionID && parent) state.parents.set(sessionID, parent)
+  // Learned only from an id that was on the wire. A guessed id is not the one
+  // that sent the request, and filing a parent under it would put a session
+  // that has nothing to do with this one inside someone else's folder.
+  if (wire && parent) state.parents.set(wire, parent)
+  const sessionID = wire ?? context?.sessionID
   // A subagent gets its own folder nowhere: it is filed with the session whose
-  // work it is doing.
-  const sess = openSession(run, rootOf(state, sessionID))
+  // work it is doing. A request carrying a parent header is a subagent's by
+  // definition, so even when its own id never reached us, the folder is the
+  // parent's — a better answer than whichever session spoke last.
+  const root = wire ? rootOf(state, wire) : parent ? rootOf(state, parent) : rootOf(state, sessionID)
+  const sess = openSession(state, run, root)
   if (!sess) return send()
   if (sessionID) sess.members.add(sessionID)
+  if (wire && parent) sess.parents.set(wire, parent)
   const turn = ++sess.turns
 
   // Decoded before the request goes out, so the reuse chain follows the order
@@ -512,6 +583,7 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
     model: model ?? context?.model.id,
     session: sessionID,
     parent_session: parent,
+    root_session: sess.id === NO_SESSION ? undefined : sess.id,
     agent: context?.agent,
     started_at: new Date(started).toISOString(),
     incomplete: true,
@@ -533,7 +605,7 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
     const spend = price(usage, context)
     const diff = resolveReuse(reuse, tokens)
     sess.pending.delete(turn)
-    tally(sess, context, model, usage, spend, tokens, reuse)
+    tally(sess, sessionID, context, model, usage, spend, tokens, reuse)
 
     const head: Head = {
       turn,
@@ -551,6 +623,9 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
       {
         ...head,
         parent_session: parent,
+        // The conversation this folder is: the same as `session` unless the turn
+        // is a subagent's, in which case it is whoever spawned it.
+        root_session: sess.id === NO_SESSION ? undefined : sess.id,
         usage,
         cost: spend,
         cache_hit_rate: hitRate(usage),
@@ -565,6 +640,10 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
         turn,
         time: head.started_at,
         session: head.session,
+        // Carried on the index line too, so grouping a folder's turns by
+        // conversation never means opening every turn file.
+        parent_session: parent,
+        root_session: sess.id === NO_SESSION ? undefined : sess.id,
         agent: head.agent,
         model: head.model,
         source: usage?.source,
@@ -632,7 +711,16 @@ function resolve(options?: PluginOptions): Settings {
   }
 }
 
-/** The run directory, opened once per process. */
+/**
+ * The folders this run has open. `run.sessions` is keyed by session id and a
+ * folder can be reached through more than one — a subagent aliased onto the
+ * conversation that owns it — so anything that walks the folders walks these.
+ */
+function folders(run: Run) {
+  return [...new Set(run.sessions.values())]
+}
+
+/** The run, opened once per process. */
 function runOf(state: State): Run | undefined {
   if (state.run !== undefined) return state.run || undefined
   const run = open(state.settings.dir)
@@ -641,56 +729,232 @@ function runOf(state: State): Run | undefined {
 }
 
 function open(base: string): Run | undefined {
-  const dir = path.join(base, `${stamp(new Date())}-${process.pid}`)
+  const now = new Date()
+  const file = path.join(base, "runs", `${stamp(now)}-${process.pid}.json`)
   try {
-    fs.mkdirSync(dir, { recursive: true })
+    fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(
       path.join(base, "latest.json"),
-      text({ time: new Date().toISOString(), pid: process.pid, cwd: process.cwd(), path: dir }),
+      text({ time: now.toISOString(), pid: process.pid, cwd: process.cwd(), path: base, run: file }),
     )
   } catch {
     return undefined
   }
-  return { dir, started: Date.now(), requests: 0, sessions: new Map(), queue: Promise.resolve() }
+  return { base, file, started: Date.now(), requests: 0, sessions: new Map(), queue: Promise.resolve() }
 }
 
 /**
- * The folder a session writes into, created the first time it sends something.
- * The name leads with the time so that a reader sorting folder names — which is
- * what the viewer does — gets the most recent conversation first.
+ * The folder a session writes into: the one it already has if it has one, so
+ * resuming a conversation appends to it rather than scattering the same
+ * conversation over a folder per run. Everything the previous run counted is
+ * read back with it, so the totals and the turn numbers carry on.
  */
-function openSession(run: Run, root: string): Session | undefined {
+function openSession(state: State, run: Run, root: string): Session | undefined {
   const existing = run.sessions.get(root)
   if (existing) return existing
-  const base = `${stamp(new Date())}-${short(root)}`
-  let name = base
-  for (let i = 2; [...run.sessions.values()].some((s) => path.basename(s.dir) === name); i++) name = `${base}-${i}`
-  const dir = path.join(run.dir, name)
+  let found: { dir: string; id: string }
+  let prior: Saved | undefined
   try {
-    fs.mkdirSync(dir, { recursive: true })
+    found = sessionDir(run.base, root)
+    prior = readState(found.dir)
+    fs.mkdirSync(found.dir, { recursive: true })
   } catch {
     return undefined
   }
-  const created: Session = {
-    id: root,
-    dir,
-    started: Date.now(),
-    turns: 0,
-    errors: 0,
-    incomplete: 0,
-    reported: bucket(),
-    estimated: bucket(),
-    byModel: new Map(),
-    byAgent: new Map(),
-    history: new Map(),
-    members: new Set(root === NO_SESSION ? [] : [root]),
-    prompt: { system: 0, tools: 0, messages: 0, total: 0 },
-    resent: 0,
-    breaks: 0,
-    pending: new Map(),
+  // The folder can already be open under another id: a subagent whose parent
+  // chain never reached us resolves to the folder its root opened. One folder
+  // is one set of counters, so the id is aliased onto the session that has it.
+  const opened = [...run.sessions.values()].find((sess) => sess.dir === found.dir)
+  if (opened) {
+    run.sessions.set(root, opened)
+    return opened
   }
+  if (prior && prior.session !== found.id) prior = undefined
+  const created: Session = {
+    id: found.id,
+    dir: found.dir,
+    started: prior?.started ?? Date.now(),
+    // Never below what is on disk: a state file that was lost or truncated must
+    // not make this run overwrite the turns the last one wrote.
+    turns: Math.max(prior?.turns ?? 0, lastTurn(found.dir)),
+    errors: prior?.errors ?? 0,
+    incomplete: prior?.incomplete ?? 0,
+    reported: prior?.reported ?? bucket(),
+    estimated: prior?.estimated ?? bucket(),
+    byModel: prior?.byModel ?? new Map(),
+    byAgent: prior?.byAgent ?? new Map(),
+    bySession: prior?.bySession ?? new Map(),
+    history: prior?.history ?? new Map(),
+    members: prior?.members ?? new Set(),
+    parents: prior?.parents ?? new Map(),
+    prompt: prior?.prompt ?? { system: 0, tools: 0, messages: 0, total: 0 },
+    resent: prior?.resent ?? 0,
+    breaks: prior?.breaks ?? 0,
+    pending: new Map(),
+    runs: [...(prior?.runs ?? []), path.basename(run.file)],
+  }
+  if (created.id !== NO_SESSION) created.members.add(created.id)
+  // The chain this folder learned in earlier runs. Without it, a subagent that
+  // spawns a subagent loses its root the moment the process restarts: the wire
+  // only ever names the immediate parent.
+  for (const [child, parent] of created.parents) if (!state.parents.has(child)) state.parents.set(child, parent)
   run.sessions.set(root, created)
+  if (root !== created.id) run.sessions.set(created.id, created)
   return created
+}
+
+/**
+ * Where a conversation lives: the same folder every time, so coming back to a
+ * session months later writes next to what it wrote then.
+ *
+ * The name leads with the time the session was first seen, so a reader sorting
+ * folder names — which is what the viewer does — reads them in the order the
+ * conversations started. The name is only a label, though: what identifies the
+ * folder is the session id in its `state.json`, because ten characters of an id
+ * are not a promise of uniqueness.
+ *
+ * A subagent asked for by its own id lands on the folder of whoever spawned it,
+ * because that folder lists it as a member — the fallback that keeps a session's
+ * work together even when the parent chain did not survive the restart. Turns
+ * that arrive without a session id have nothing to be matched on at all, so they
+ * always open a folder of their own.
+ */
+function sessionDir(base: string, id: string): { dir: string; id: string } {
+  if (id !== NO_SESSION) {
+    const pattern = new RegExp(`^\\d{8}_\\d{6}-${escaped(short(id))}(-\\d+)?$`)
+    const folders = []
+    for (const name of entriesOf(base).sort()) {
+      const dir = path.join(base, name)
+      if (pattern.test(name)) {
+        const saved = readState(dir)
+        if (saved?.session === id) return { dir, id }
+      } else if (/^\d{8}_\d{6}-/.test(name)) folders.push(dir)
+    }
+    for (const dir of folders) {
+      const saved = readState(dir)
+      if (saved && saved.session !== NO_SESSION && saved.members.has(id)) return { dir, id: saved.session }
+    }
+  }
+  const first = `${stamp(new Date())}-${short(id)}`
+  let name = first
+  for (let i = 2; fs.existsSync(path.join(base, name)); i++) name = `${first}-${i}`
+  return { dir: path.join(base, name), id }
+}
+
+function entriesOf(dir: string): string[] {
+  try {
+    return fs.readdirSync(dir)
+  } catch {
+    return []
+  }
+}
+
+/** The highest turn already written to a folder, whatever its state file says. */
+function lastTurn(dir: string) {
+  let highest = 0
+  for (const name of entriesOf(dir)) {
+    const match = /^turn_(\d+)/.exec(name)
+    if (match) highest = Math.max(highest, Number(match[1]))
+  }
+  return highest
+}
+
+/**
+ * The folder as the last run left it. Anything unreadable is treated as absent:
+ * starting the counts over is a wrong number in one folder, while trusting a
+ * file we cannot parse would merge two conversations.
+ */
+function readState(dir: string): Saved | undefined {
+  let data: unknown
+  try {
+    data = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"))
+  } catch {
+    return undefined
+  }
+  if (!isRecord(data) || typeof data["session"] !== "string") return undefined
+  const prompt = isRecord(data["prompt"]) ? data["prompt"] : {}
+  return {
+    session: data["session"],
+    started: num(data["started"]) || Date.now(),
+    turns: num(data["turns"]),
+    errors: num(data["errors"]),
+    incomplete: num(data["incomplete"]),
+    reported: reviveBucket(data["reported"]),
+    estimated: reviveBucket(data["estimated"]),
+    byModel: reviveBuckets(data["by_model"]),
+    byAgent: reviveBuckets(data["by_agent"]),
+    bySession: reviveBuckets(data["by_session"]),
+    history: reviveHistory(data["history"]),
+    members: new Set(strings(data["members"])),
+    parents: reviveParents(data["parents"]),
+    prompt: {
+      system: num(prompt["system"]),
+      tools: num(prompt["tools"]),
+      messages: num(prompt["messages"]),
+      total: num(prompt["total"]),
+    },
+    resent: num(data["resent"]),
+    breaks: num(data["breaks"]),
+    runs: strings(data["runs"]),
+  }
+}
+
+/** The child -> parent links this folder has seen, as the next run needs them. */
+function reviveParents(value: unknown): Map<string, string> {
+  const map = new Map<string, string>()
+  if (!isRecord(value)) return map
+  for (const [child, parent] of Object.entries(value)) if (typeof parent === "string") map.set(child, parent)
+  return map
+}
+
+function reviveBucket(value: unknown): Bucket {
+  const created = bucket()
+  if (!isRecord(value)) return created
+  created.turns = num(value["turns"])
+  created.cost = num(value["cost"])
+  created.provider_cost = num(value["provider_cost"])
+  const usage = isRecord(value["usage"]) ? value["usage"] : {}
+  for (const key of ["input", "cache_read", "cache_write", "output", "reasoning", "prompt", "total"] as const)
+    created.usage[key] = num(usage[key])
+  const details = isRecord(usage["details"]) ? usage["details"] : undefined
+  const kept: Record<string, number> = {}
+  for (const [key, amount] of Object.entries(details ?? {})) if (typeof amount === "number") kept[key] = amount
+  if (Object.keys(kept).length) created.usage.details = kept
+  return created
+}
+
+function reviveBuckets(value: unknown): Map<string, Bucket> {
+  const map = new Map<string, Bucket>()
+  if (!isRecord(value)) return map
+  for (const [key, entry] of Object.entries(value)) map.set(key, reviveBucket(entry))
+  return map
+}
+
+/** The prompt fingerprints, so the first turn after a resume still diffs. */
+function reviveHistory(value: unknown): Map<string, Fingerprint> {
+  const map = new Map<string, Fingerprint>()
+  if (!isRecord(value)) return map
+  for (const [key, entry] of Object.entries(value)) {
+    if (!isRecord(entry)) continue
+    if (typeof entry["system"] !== "string" || typeof entry["tools"] !== "string") continue
+    if (!Array.isArray(entry["messages"]) || !Array.isArray(entry["chars"])) continue
+    map.set(key, {
+      turn: num(entry["turn"]),
+      system: entry["system"],
+      tools: entry["tools"],
+      messages: strings(entry["messages"]),
+      chars: entry["chars"].map(num),
+    })
+  }
+  return map
+}
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []
+}
+
+function escaped(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
 /** Walks the parent chain up to the session that owns the work. */
@@ -718,15 +982,57 @@ function persist(
   body: Record<string, unknown>,
   index: Record<string, unknown>,
 ) {
-  const name = `turn_${String(turn).padStart(3, "0")}`
   run.queue = run.queue
     .then(async () => {
-      await fs.promises.writeFile(path.join(sess.dir, `${name}.json`), text(body))
+      await fs.promises.writeFile(turnPath(sess, turn), text(body))
       await fs.promises.appendFile(path.join(sess.dir, "turns.jsonl"), JSON.stringify(index) + "\n")
       await fs.promises.writeFile(path.join(sess.dir, "summary.json"), text(summary(sess)))
-      await fs.promises.writeFile(path.join(run.dir, "summary.json"), text(runSummary(run)))
+      await fs.promises.writeFile(path.join(sess.dir, "state.json"), text(checkpoint(sess)))
+      await fs.promises.writeFile(run.file, text(runSummary(run)))
     })
     .catch(() => undefined)
+}
+
+/**
+ * Where a turn is written. The name is the turn number — unless a file of that
+ * name is already there, which means two processes are on the same conversation
+ * at once, and the one arriving second keeps its copy rather than overwriting
+ * the other's. The turn number inside the record is the one that counts.
+ */
+function turnPath(sess: Session, turn: number) {
+  const name = `turn_${String(turn).padStart(3, "0")}`
+  let file = path.join(sess.dir, `${name}.json`)
+  for (let i = 2; fs.existsSync(file); i++) file = path.join(sess.dir, `${name}-${i}.json`)
+  return file
+}
+
+/**
+ * What the next run needs to continue this folder: the counters in the shape
+ * they are kept in memory, so resuming restores them exactly rather than
+ * reconstructing them from the rounded, human-facing summary next to it.
+ */
+function checkpoint(sess: Session) {
+  return {
+    version: 1,
+    session: sess.id,
+    started: sess.started,
+    updated: Date.now(),
+    turns: sess.turns,
+    errors: sess.errors,
+    incomplete: sess.incomplete,
+    reported: sess.reported,
+    estimated: sess.estimated,
+    by_model: Object.fromEntries(sess.byModel),
+    by_agent: Object.fromEntries(sess.byAgent),
+    by_session: Object.fromEntries(sess.bySession),
+    prompt: sess.prompt,
+    resent: sess.resent,
+    breaks: sess.breaks,
+    members: [...sess.members],
+    parents: Object.fromEntries(sess.parents),
+    history: Object.fromEntries(sess.history),
+    runs: sess.runs,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +1041,7 @@ function persist(
 
 function tally(
   sess: Session,
+  sessionID: string | undefined,
   context: Context | undefined,
   model: string | undefined,
   usage: Usage | undefined,
@@ -758,6 +1065,7 @@ function tally(
     usage.source === "provider" ? sess.reported : sess.estimated,
     into(sess.byModel, name),
     into(sess.byAgent, context?.agent ?? "?"),
+    into(sess.bySession, sessionID ?? "?"),
   ])
     accumulate(target, usage, spend)
 }
@@ -813,8 +1121,22 @@ function summary(sess: Session) {
     // Both breakdowns count every turn, estimated ones included.
     by_model: Object.fromEntries([...sess.byModel].map(([name, value]) => [name, shape(value)])),
     by_agent: Object.fromEntries([...sess.byAgent].map(([name, value]) => [name, shape(value)])),
+    // Per conversation filed here: the root, and a row for each subagent it
+    // spawned — what the `task` tool actually cost, without leaving the folder.
+    by_session:
+      sess.bySession.size > 1
+        ? Object.fromEntries([...sess.bySession].map(([name, value]) => [name, shape(value)]))
+        : undefined,
+    // Who spawned whom, for a reader putting the rows above in order.
+    session_parents: sess.parents.size ? Object.fromEntries(sess.parents) : undefined,
+    // The conversation's own clock: first turn to last, which for a session
+    // that was resumed spans the time it sat idle in between.
     elapsed_seconds: (Date.now() - sess.started) / 1000,
     started_at: new Date(sess.started).toISOString(),
+    updated_at: new Date().toISOString(),
+    // The runs that wrote here. More than one means the session was resumed,
+    // and that everything above is the total over all of them.
+    runs: sess.runs.length > 1 ? sess.runs : undefined,
     path: sess.dir,
   }
 }
@@ -829,12 +1151,15 @@ function runSummary(run: Run) {
     pid: process.pid,
     cwd: process.cwd(),
     requests: run.requests,
-    // One folder per session — that is the unit a reader groups by.
+    // One folder per session — that is the unit a reader groups by. The counts
+    // are the folder's, not this run's: a resumed session brings its history
+    // with it, and splitting the two would only invite adding them together.
     sessions: Object.fromEntries(
-      [...run.sessions.values()].map((sess) => [
+      folders(run).map((sess) => [
         path.basename(sess.dir),
         {
           session: sess.id === NO_SESSION ? undefined : sess.id,
+          resumed: sess.runs.length > 1 || undefined,
           turns: sess.turns,
           errors: sess.errors,
           tokens: shape(sess.reported),
@@ -843,7 +1168,8 @@ function runSummary(run: Run) {
       ]),
     ),
     elapsed_seconds: (Date.now() - run.started) / 1000,
-    path: run.dir,
+    dir: run.base,
+    path: run.file,
   }
 }
 

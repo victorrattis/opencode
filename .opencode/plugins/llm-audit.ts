@@ -1,11 +1,11 @@
 // Wire-level audit log for LLM provider traffic.
 //
 // Answers "what did opencode actually send to the model, what came back, and
-// what did it cost?" — the full system prompt, the tool schemas, every message
-// in the history, the assembled reply, and the token bill, one record per model
-// request. Self-contained: drop this one file in `.opencode/plugins/` (project)
-// or `~/.config/opencode/plugins/` (global) of a stock opencode install and it
-// works. No fork, no dependencies.
+// how many tokens did it take?" — the full system prompt, the tool schemas,
+// every message in the history, the assembled reply, and the token bill, one
+// record per model request. Self-contained: drop this one file in
+// `.opencode/plugins/` (project) or `~/.config/opencode/plugins/` (global) of
+// a stock opencode install and it works. No fork, no dependencies.
 //
 // Enable with `OPENCODE_LLM_AUDIT=1` (or point `OPENCODE_LLM_AUDIT_DIR` at a
 // directory), or from config:
@@ -28,7 +28,7 @@
 // that conversation's folder — numbered in the same sequence, in the order they
 // were actually sent. Each turn says which session it came from (`session`), who
 // spawned it (`parent_session`) and whose folder it is in (`root_session`), and
-// `summary.json` breaks the totals down `by_session` so what a subagent cost is
+// `summary.json` breaks the totals down `by_session` so what a subagent used is
 // a number you can read off.
 //
 // Per turn, `<dir>/<timestamp>-<session>/turn_NNN.json` holds:
@@ -43,7 +43,6 @@
 //   reply    the model's output assembled from the stream: text, reasoning,
 //            tool calls with arguments, stop reason
 //   usage    the token bill (see below)
-//   cost     what that bill is worth at the model's catalog price
 //   request  the verbatim bytes on the wire (method, URL, headers, body)
 //   response status, headers, parsed JSON or SSE events
 //
@@ -86,8 +85,8 @@
 // The one thing it cannot see: GitLab Duo workflow models, which stream over a
 // WebSocket instead of HTTP.
 //
-// `chat.params` supplies what the wire does not carry — session, agent, and the
-// model's catalog pricing for the cost estimate.
+// `chat.params` supplies what the wire does not carry — session, agent, and
+// model id, used to attribute and label each turn.
 //
 // Credentials in headers and query params are redacted; bodies are stored
 // verbatim, so treat the directory as sensitive.
@@ -169,7 +168,6 @@ type FetchLike = typeof globalThis.fetch
 type ModelInfo = {
   id: string
   providerID: string
-  cost: { input: number; output: number; cache: { read: number; write: number } }
 }
 
 /**
@@ -210,7 +208,7 @@ type Context = {
 
 // One decoded piece of the prompt: a system block, a tool schema, or a message.
 // Sized in characters here; tokens are attributed later, once the provider has
-// said what the whole prompt actually cost.
+// said what the whole prompt was actually billed at.
 type Piece = {
   index: number
   role?: string
@@ -313,8 +311,6 @@ type Head = {
 type Bucket = {
   turns: number
   usage: Usage
-  cost: number
-  provider_cost: number
 }
 
 /**
@@ -342,7 +338,7 @@ type Session = {
   estimated: Bucket
   byModel: Map<string, Bucket>
   byAgent: Map<string, Bucket>
-  // Per session id filed here, so what a subagent cost is a number and not an
+  // Per session id filed here, so what a subagent used is a number and not an
   // inference from the agent breakdown.
   bySession: Map<string, Bucket>
   // The reuse chains. Keeping them on the session makes diffing one
@@ -587,7 +583,7 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
     agent: context?.agent,
     started_at: new Date(started).toISOString(),
     incomplete: true,
-    note: "the process exited while this request was still in flight, so nothing is known about what it cost",
+    note: "the process exited while this request was still in flight, so nothing is known about its token usage",
     prompt: view(prompt),
     reuse: resolveReuse(reuse, undefined),
     request: sent,
@@ -602,10 +598,9 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
     // as zero would quietly understate the run, so estimate it and label it.
     const usage = reported ?? (billed ? guess(prompt, result.reply) : undefined)
     const tokens = attribute(prompt, usage)
-    const spend = price(usage, context)
     const diff = resolveReuse(reuse, tokens)
     sess.pending.delete(turn)
-    tally(sess, sessionID, context, model, usage, spend, tokens, reuse)
+    tally(sess, sessionID, context, model, usage, tokens, reuse)
 
     const head: Head = {
       turn,
@@ -627,7 +622,6 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
         // is a subagent's, in which case it is whoever spawned it.
         root_session: sess.id === NO_SESSION ? undefined : sess.id,
         usage,
-        cost: spend,
         cache_hit_rate: hitRate(usage),
         prompt: tokens?.view ?? view(prompt),
         reuse: diff,
@@ -662,7 +656,6 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
         prefix_stable: reuse?.prefix_stable,
         stop_reason: result.reply?.stop_reason,
         tool_calls: result.reply?.tool_calls.map((call) => call.name).filter(Boolean),
-        cost_usd: spend?.estimated_usd,
         seconds: head.elapsed_seconds,
       },
     )
@@ -911,8 +904,6 @@ function reviveBucket(value: unknown): Bucket {
   const created = bucket()
   if (!isRecord(value)) return created
   created.turns = num(value["turns"])
-  created.cost = num(value["cost"])
-  created.provider_cost = num(value["provider_cost"])
   const usage = isRecord(value["usage"]) ? value["usage"] : {}
   for (const key of ["input", "cache_read", "cache_write", "output", "reasoning", "prompt", "total"] as const)
     created.usage[key] = num(usage[key])
@@ -1045,7 +1036,6 @@ function tally(
   context: Context | undefined,
   model: string | undefined,
   usage: Usage | undefined,
-  spend: Spend | undefined,
   tokens: Attributed | undefined,
   reuse: Reuse | undefined,
 ) {
@@ -1067,14 +1057,12 @@ function tally(
     into(sess.byAgent, context?.agent ?? "?"),
     into(sess.bySession, sessionID ?? "?"),
   ])
-    accumulate(target, usage, spend)
+    accumulate(target, usage)
 }
 
-function accumulate(target: Bucket, usage: Usage, spend: Spend | undefined) {
+function accumulate(target: Bucket, usage: Usage) {
   target.turns += 1
   add(target.usage, usage)
-  target.cost += spend?.estimated_usd ?? 0
-  target.provider_cost += spend?.provider_usd ?? 0
 }
 
 function into(map: Map<string, Bucket>, key: string) {
@@ -1086,7 +1074,7 @@ function into(map: Map<string, Bucket>, key: string) {
 }
 
 function bucket(): Bucket {
-  return { turns: 0, usage: zero("provider"), cost: 0, provider_cost: 0 }
+  return { turns: 0, usage: zero("provider") }
 }
 
 /** What one session's folder is worth, written as its `summary.json`. */
@@ -1108,21 +1096,19 @@ function summary(sess: Session) {
     tokens: shape(reported),
     estimated_tokens: estimated.turns ? shape(estimated) : undefined,
     coverage: `${reported.turns}/${reported.turns + estimated.turns} turns counted by the provider`,
-    cost_usd: round(reported.cost + estimated.cost),
-    provider_cost_usd: reported.provider_cost ? round(reported.provider_cost) : undefined,
     // Where the prompt tokens went, summed over the run.
     prompt_tokens_by_part: sess.prompt,
     // Prompt the model saw again because it was an unchanged prefix: cheap when
     // the provider caches it, paid in full when the prefix keeps breaking.
     resent_tokens: sess.resent,
     // Turns whose cacheable prefix changed. Every one of these is a cache miss
-    // on the whole history — the first thing to look at when costs are high.
+    // on the whole history — the first thing to look at when token usage is high.
     prefix_breaks: sess.breaks,
     // Both breakdowns count every turn, estimated ones included.
     by_model: Object.fromEntries([...sess.byModel].map(([name, value]) => [name, shape(value)])),
     by_agent: Object.fromEntries([...sess.byAgent].map(([name, value]) => [name, shape(value)])),
     // Per conversation filed here: the root, and a row for each subagent it
-    // spawned — what the `task` tool actually cost, without leaving the folder.
+    // spawned — what the `task` tool actually used, without leaving the folder.
     by_session:
       sess.bySession.size > 1
         ? Object.fromEntries([...sess.bySession].map(([name, value]) => [name, shape(value)]))
@@ -1163,7 +1149,6 @@ function runSummary(run: Run) {
           turns: sess.turns,
           errors: sess.errors,
           tokens: shape(sess.reported),
-          cost_usd: round(sess.reported.cost + sess.estimated.cost),
         },
       ]),
     ),
@@ -1185,8 +1170,6 @@ function shape(value: Bucket) {
     reasoning: usage.reasoning,
     total: usage.total,
     cache_hit_rate: hitRate(usage),
-    cost_usd: round(value.cost),
-    provider_cost_usd: value.provider_cost ? round(value.provider_cost) : undefined,
     details: usage.details && Object.keys(usage.details).length ? usage.details : undefined,
   }
 }
@@ -1323,47 +1306,6 @@ function guess(prompt: Prompt | undefined, reply: Reply | undefined): Usage | un
   usage.prompt = usage.input
   usage.total = usage.prompt + usage.output
   return usage.total ? usage : undefined
-}
-
-type Spend = {
-  estimated_usd: number
-  provider_usd?: number
-  model?: string
-  per_million?: { input: number; output: number; cache_read: number; cache_write: number }
-  note?: string
-}
-
-/**
- * What the turn is worth at the model's catalog price. Anthropic's one-hour
- * cache writes are billed at twice the base input rate where the catalog's
- * `cache.write` is the five-minute price, so they are priced apart.
- */
-function price(usage: Usage | undefined, context: Context | undefined): Spend | undefined {
-  if (!usage) return undefined
-  const provider = num(usage.details?.["provider_cost"])
-  if (!context) return provider ? { estimated_usd: round(provider), provider_usd: round(provider) } : undefined
-  const cost = context.model.cost
-  const long = num(usage.details?.["cache_write_1h"])
-  const short = Math.max(0, usage.cache_write - long)
-  const estimated =
-    (usage.input * cost.input +
-      usage.output * cost.output +
-      usage.cache_read * cost.cache.read +
-      short * cost.cache.write +
-      long * cost.input * 2) /
-    1_000_000
-  return {
-    estimated_usd: round(estimated),
-    provider_usd: provider ? round(provider) : undefined,
-    model: context.model.id,
-    per_million: {
-      input: cost.input,
-      output: cost.output,
-      cache_read: cost.cache.read,
-      cache_write: cost.cache.write,
-    },
-    note: usage.source === "estimated" ? "token counts estimated: the provider reported none" : undefined,
-  }
 }
 
 /** Share of the prompt the provider served from cache rather than reading anew. */

@@ -21,7 +21,10 @@
 //
 //   <dir>/<timestamp>-<session>/        one conversation, from its first turn
 //   <dir>/<timestamp>-<session>/pieces.jsonl   its prompts, each kept once
+//   <dir>/<timestamp>-<session>/tools.jsonl    one line per tool it ran
+//   <dir>/<timestamp>-<session>/events.jsonl   compaction, as it happened
 //   <dir>/runs/<timestamp>-<pid>.json   what one process did, as an index
+//   <dir>/runs/<timestamp>-<pid>.config.json   the config it ran with, redacted
 //   <dir>/latest.json                   where the current process is writing
 //
 // A subagent (the `task` tool) is a session of its own on the wire, with its own
@@ -42,10 +45,26 @@
 //            of the prompt is a byte-identical prefix (cacheable) and where it
 //            first diverged — the number to watch when hunting for waste
 //   reply    the model's output assembled from the stream: text, reasoning,
-//            tool calls with arguments, stop reason
+//            tool calls with their ids and arguments, stop reason
 //   usage    the token bill (see below)
+//   timing   when the answer arrived: first byte, first token, last byte. The
+//            split that tells a slow provider from a long answer
 //   request  the verbatim bytes on the wire (method, URL, headers, body)
 //   response status, headers, parsed JSON or SSE events
+//
+// plus, when there is something to say: `request_index`, which numbers the
+// thing the user typed that this turn is part of; `retry_of`, when the prompt
+// repeats a turn the provider rejected, so the tokens are being paid twice; and
+// `compaction`, on the first turn sent after the history was rewritten, with
+// what that rewrite threw away.
+//
+// Every message row in `prompt` names the tool traffic inside it. A `tool_use`
+// carries the call's id and the tool's name; a `tool_result` carries the id it
+// answers and — resolved from the call that went by earlier — the name of the
+// tool that produced it. That is what lets `summary.json` say, in `by_tool`,
+// what each tool has cost: `result_tokens` the first time its output was sent,
+// and `resent_tokens` for every turn it has travelled in since, which in a long
+// session is the larger of the two by far.
 //
 // The bulk of that is the conversation, and every turn carries all of it again
 // — the same tool schemas, the same system prompt, the same messages as the
@@ -101,8 +120,29 @@
 // The one thing it cannot see: GitLab Duo workflow models, which stream over a
 // WebSocket instead of HTTP.
 //
-// `chat.params` supplies what the wire does not carry — session, agent, and
-// model id, used to attribute and label each turn.
+// The hooks supply what the wire does not carry, and none of them writes to its
+// `output`, so arming the audit cannot change what opencode does:
+//
+//   chat.params    session, agent and model id, to attribute and label a turn
+//   chat.message   the user typed something: the boundary `request_index` counts
+//   tool.execute.*  what running a tool cost in wall clock, and whether it
+//                  failed at all — a `before` with no `after` is the failure,
+//                  because opencode does not fire `after` on the throwing path
+//   compaction     `experimental.session.compacting`, `...autocontinue` and the
+//                  `session.compacted` event, which between them say when the
+//                  history was rewritten and whether the context forced it
+//   config         a hash of the resolved config, so two runs can be told apart
+//                  when what changed between them is a setting
+//
+// A tool execution is written to `tools.jsonl`, keyed by the same call id the
+// wire uses, so the line and the tokens its output occupies are one join apart:
+// `call_id` -> the `tool_results` entry on a prompt row -> that row's `ref` ->
+// the bytes in `pieces.jsonl`. The output itself is never written to
+// `tools.jsonl`; it is already on disk as the next turn's tool result.
+//
+// The one place that join does not hold is the `task` tool, which opencode
+// identifies to the hooks by a part id rather than the id it put on the wire.
+// Those lines match on tool, session and time instead.
 //
 // Credentials in headers and query params are redacted; bodies are stored
 // verbatim — in the turn or in the piece store next to it — so treat the
@@ -186,6 +226,19 @@ const PIECE_FILE = "pieces.jsonl"
 // Where the providers put their token counts. Cohere hangs them off `meta`.
 const USAGE_KEY = /^(usage|usage_?metadata|billed_units|token_?usage)$/i
 
+// How many tool call ids to carry across a restart. A result answers a call
+// from the turn before it, so the recent ones are the only ones anybody joins
+// on, and the map would otherwise grow for the length of the conversation.
+const TOOL_NAME_LIMIT = 2000
+
+// Files a session folder keeps alongside its turns.
+const TOOL_FILE = "tools.jsonl"
+const EVENT_FILE = "events.jsonl"
+
+// Bumped when the shape of what is written changes, so a reader looking at an
+// old folder knows which fields it can expect to find.
+const PLUGIN_VERSION = 2
+
 type FetchLike = typeof globalThis.fetch
 
 // Only the parts of the model this file uses. Declared locally because
@@ -194,6 +247,11 @@ type FetchLike = typeof globalThis.fetch
 type ModelInfo = {
   id: string
   providerID: string
+  // opencode's own catalog price for this model, per million tokens. Recorded
+  // rather than turned into a dollar figure: the amount is arithmetic anyone can
+  // redo, while the rate is a fact about the moment the request went out, and
+  // the catalog is the only place it is both current and complete.
+  cost?: { input: number; output: number; cache: { read: number; write: number } }
 }
 
 /**
@@ -261,6 +319,12 @@ type Piece = {
   text?: string
   // Hash of the piece with the cache markers removed, for the reuse diff.
   stable?: string
+  // The tool traffic inside this message. `kinds` says a block is a
+  // `tool_result`; these say whose it is — without them the tokens a message
+  // carries cannot be charged to the tool that produced them, which is the
+  // first question anyone asks of this log.
+  tool_calls?: { id?: string; name?: string; chars: number }[]
+  tool_results?: { id?: string; tool?: string; chars: number; error?: boolean }[]
 }
 
 type Prompt = {
@@ -315,8 +379,16 @@ type Reuse = {
   added_messages: number
   dropped_messages: number
   prefix_stable: boolean
+  // The prompt is the previous one, to the byte. Either the harness sent the
+  // same request twice — a retry, when the first attempt failed — or it sent a
+  // turn that added nothing, which is a bug worth seeing either way.
+  identical: boolean
   resent_chars: number
   new_chars: number
+  // The size of what is no longer in the prompt, read off the previous turn —
+  // this one cannot say, the messages are gone from it. What compaction costs
+  // is measured here.
+  dropped_chars: number
   // The message the prefix broke on: what it is, and where to read both
   // versions of it. The first thing to look at when the cache stops hitting.
   changed_piece?: { index: number; role?: string; preview?: string; before?: string; after?: string }
@@ -325,7 +397,10 @@ type Reuse = {
 type Reply = {
   text: string
   reasoning: string
-  tool_calls: { name?: string; arguments: unknown; chars: number }[]
+  // `id` is the provider's tool call id: what the next turn's `tool_result`
+  // points back at, and what `tools.jsonl` is keyed by. It is the join between
+  // what the model asked for and what running it actually cost.
+  tool_calls: { id?: string; name?: string; arguments: unknown; chars: number }[]
   stop_reason?: string
   chars: { text: number; reasoning: number; tool_calls: number; total: number }
 }
@@ -333,8 +408,29 @@ type Reply = {
 type Draft = {
   text: string[]
   reasoning: string[]
-  calls: Map<string, { name?: string; args: string }>
+  calls: Map<string, { id?: string; name?: string; args: string }>
   stop?: string
+}
+
+/**
+ * How the response arrived, in milliseconds from the request going out.
+ *
+ * `elapsed_seconds` alone cannot tell a slow provider from a long answer: both
+ * are one big number. The split is what makes the difference readable —
+ * `first_token_ms` is the provider's latency, and what comes after it is the
+ * model generating, which is priced per token and not per second.
+ */
+type Timing = {
+  first_byte_ms: number
+  // When the first frame carrying generated content arrived. Only for a stream:
+  // a response delivered whole has no such moment, and a number there would
+  // invite comparing it with one that means something else.
+  first_token_ms?: number
+  last_byte_ms: number
+  // Time spent streaming, first byte to last. Divide the output tokens by it for
+  // the generation rate.
+  stream_ms: number
+  chunks: number
 }
 
 // The fields that identify a turn, at the head of its record.
@@ -354,6 +450,44 @@ type Head = {
 type Bucket = {
   turns: number
   usage: Usage
+}
+
+/**
+ * What one tool has cost the conversation.
+ *
+ * Two halves that answer different questions. `result_tokens` is the prompt
+ * tokens its output occupied — the money it costs, and it keeps costing it on
+ * every turn afterwards, because the result stays in the history. `ms` is the
+ * wall clock it took, which costs no tokens at all but is the whole of what a
+ * slow session feels like.
+ */
+type ToolCost = {
+  calls: number
+  result_tokens: number
+  result_chars: number
+  // What re-sending that same output has cost since. A result is written to the
+  // history once and then travels in every prompt after it, so a tool that
+  // returns too much is not paid for once — it is paid for on every turn that
+  // follows, which is where the money in a long session actually goes.
+  resent_tokens: number
+  errors: number
+  // From the execution hooks rather than the wire, so they stay at zero for a
+  // provider-only record. `runs` counts the executions actually observed.
+  runs: number
+  failed: number
+  ms: number
+  ms_max: number
+  output_chars: number
+}
+
+/** A tool execution between `tool.execute.before` and its `after`. */
+type Running = {
+  tool: string
+  session: string
+  started: number
+  args_chars: number
+  args_preview?: string
+  request_index?: number
 }
 
 /**
@@ -398,6 +532,38 @@ type Session = {
   // The pieces already in this folder's store, by hash. What is here is what
   // the next turn can point at instead of writing again.
   pieces: Set<string>
+  // Tool call id -> tool name, learned from the `tool_use` blocks as they go by.
+  // A `tool_result` names only the id it answers, so without this the row that
+  // carries the tokens cannot say which tool earned them.
+  toolNames: Map<string, string>
+  // What each tool has cost, summed over the folder: the tokens of the results
+  // it returned, and how often it was called.
+  byTool: Map<string, ToolCost>
+  // Tool executions still running, by call id, from `tool.execute.before`. A
+  // call that never gets its `after` failed, was denied, or was interrupted.
+  runningTools: Map<string, Running>
+  // Compaction that has happened but whose cost is not yet visible, per session
+  // id: the next turn that session sends is the one that shows what it dropped.
+  pendingCompaction: Map<string, { at: string; overflow?: boolean }>
+  // How many things the user has typed, per session id. A turn is filed under
+  // the request that caused it, which is the unit a person recognizes — one
+  // question of theirs, however many round trips it took to answer.
+  requests: Map<string, number>
+  // The last user message id seen per session, carried onto the turns so a
+  // request can be found again in opencode's own storage.
+  messages: Map<string, string>
+  // How each turn ended, by turn number. Keyed by the number rather than by the
+  // chain because the responses do not come back in the order the requests went
+  // out — a request the provider rejects in one millisecond lands long before
+  // the streamed answer sent ahead of it — and a map keyed by chain would hand
+  // a turn whichever outcome happened to arrive last. Written when the response
+  // headers arrive, which is the order opencode itself sees.
+  outcomes: Map<number, { failed: boolean; status?: number }>
+  retries: number
+  retryTokens: number
+  compactions: number
+  compactionOverflow: number
+  compactionDropped: number
   // Turns whose response had not landed yet. A request still in flight when the
   // process exits would otherwise leave no trace at all.
   pending: Map<number, Record<string, unknown>>
@@ -425,6 +591,14 @@ type Saved = {
   resent: number
   breaks: number
   runs: string[]
+  toolNames: Map<string, string>
+  byTool: Map<string, ToolCost>
+  requests: Map<string, number>
+  retries: number
+  retryTokens: number
+  compactions: number
+  compactionOverflow: number
+  compactionDropped: number
 }
 
 // The process. It owns no folder of its own: the folders belong to the
@@ -437,6 +611,11 @@ type Run = {
   requests: number
   sessions: Map<string, Session>
   queue: Promise<void>
+  // What this opencode was, so two runs can be told apart when the point of
+  // comparing them is a setting that changed between the two. Learned from the
+  // hooks, and absent on a run that recorded traffic before they fired.
+  version?: string
+  configHash?: string
 }
 
 // opencode can create more than one plugin instance per process; they all share
@@ -474,7 +653,199 @@ export const LLMAuditPlugin: Plugin = async (_input, options) => {
       state.byModel.set(context.model.id, context)
       state.recent = context
     },
+
+    // The rest of the hooks record what the wire cannot show. A tool call is a
+    // string in the next prompt by the time it reaches the network: what it
+    // cost to run, how long it took, and whether it failed at all happen
+    // entirely inside opencode. Same for compaction, which the wire shows only
+    // as a history that mysteriously got shorter.
+    //
+    // Every one of them is read-only. None writes to its `output` argument, so
+    // arming the audit cannot change what opencode does — only what is known
+    // about it.
+
+    /** A new thing the user typed: the boundary the turns are grouped by. */
+    async "chat.message"(input) {
+      const sess = sessionOf(state, input.sessionID)
+      if (!sess) return
+      const next = (sess.requests.get(input.sessionID) ?? 0) + 1
+      sess.requests.set(input.sessionID, next)
+      if (input.messageID) sess.messages.set(input.sessionID, input.messageID)
+    },
+
+    async "tool.execute.before"(input, output) {
+      const sess = sessionOf(state, input.sessionID)
+      if (!sess) return
+      const serial = safeStringify(output.args)
+      sess.runningTools.set(input.callID, {
+        tool: input.tool,
+        session: input.sessionID,
+        started: Date.now(),
+        args_chars: serial.length,
+        args_preview: preview(serial),
+        request_index: sess.requests.get(input.sessionID),
+      })
+    },
+
+    async "tool.execute.after"(input, output) {
+      const sess = sessionOf(state, input.sessionID)
+      const run = runOf(state)
+      if (!sess || !run) return
+      const started = sess.runningTools.get(input.callID)
+      sess.runningTools.delete(input.callID)
+      const ms = started ? Date.now() - started.started : undefined
+      const text = typeof output.output === "string" ? output.output : safeStringify(output.output)
+      const cost = toolCost(sess, input.tool)
+      cost.runs += 1
+      cost.output_chars += text.length
+      if (ms !== undefined) {
+        cost.ms += ms
+        cost.ms_max = Math.max(cost.ms_max, ms)
+      }
+      append(run, sess, TOOL_FILE, {
+        call_id: input.callID,
+        tool: input.tool,
+        session: input.sessionID,
+        root_session: sess.id === NO_SESSION ? undefined : sess.id,
+        request_index: started?.request_index ?? sess.requests.get(input.sessionID),
+        started_at: new Date(started?.started ?? Date.now()).toISOString(),
+        ms,
+        args_chars: started?.args_chars ?? safeStringify(input.args).length,
+        args_preview: started?.args_preview ?? preview(safeStringify(input.args)),
+        title: output.title,
+        output_chars: text.length,
+        output_preview: preview(text),
+        // The whole output is not written here. It reaches the model as the next
+        // turn's tool result, and the store already holds that message verbatim,
+        // so the way to it is `call_id` -> the `tool_results` entry on a prompt
+        // row -> that row's `ref`. Repeating the bytes would be a third copy of
+        // something already on disk twice.
+        metadata_keys: isRecord(output.metadata) ? Object.keys(output.metadata) : undefined,
+        ok: true,
+      })
+    },
+
+    /** Compaction, in the three moments opencode announces it. */
+    async "experimental.session.compacting"(input) {
+      const sess = sessionOf(state, input.sessionID)
+      const run = runOf(state)
+      if (sess && run) append(run, sess, EVENT_FILE, event("compacting", input.sessionID, sess))
+    },
+
+    async "experimental.compaction.autocontinue"(input) {
+      const sess = sessionOf(state, input.sessionID)
+      const run = runOf(state)
+      if (!sess || !run) return
+      const at = new Date().toISOString()
+      // `overflow` is the distinction that matters: a compaction the context
+      // forced is a limit being hit, an elective one is a choice.
+      sess.pendingCompaction.set(input.sessionID, { at, overflow: input.overflow })
+      append(run, sess, EVENT_FILE, { ...event("compacted", input.sessionID, sess), overflow: input.overflow })
+    },
+
+    async event({ event: incoming }) {
+      if (incoming.type !== "session.compacted") return
+      const sessionID = str(record(incoming.properties)?.["sessionID"])
+      if (!sessionID) return
+      const sess = sessionOf(state, sessionID)
+      const run = runOf(state)
+      if (!sess || !run) return
+      // The autocontinue hook is the one that knows about `overflow`, and it may
+      // or may not run. Whichever arrives first opens the pending record; the
+      // other only fills it in.
+      if (!sess.pendingCompaction.has(sessionID))
+        sess.pendingCompaction.set(sessionID, { at: new Date().toISOString() })
+      append(run, sess, EVENT_FILE, event("session.compacted", sessionID, sess))
+    },
+
+    /** What this opencode was configured to be, for comparing one run to another. */
+    async config(input) {
+      const run = runOf(state)
+      if (!run || run.configHash) return
+      const redacted = redactDeep(input)
+      run.configHash = hash(safeJson(redacted))
+      run.version ??= await version()
+      run.queue = run.queue
+        .then(() => fs.promises.writeFile(run.file.replace(/\.json$/, ".config.json"), text(redacted)))
+        .then(() => fs.promises.writeFile(run.file, text(runSummary(run))))
+        .catch(() => undefined)
+    },
   }
+}
+
+/**
+ * Which opencode this is, if it will say.
+ *
+ * There is no route on the SDK client that reports it and no environment
+ * variable that carries it, so the only handle is the module the built-in
+ * plugins import it from. That module is not a declared dependency of this
+ * file, and making it one would cost the property that matters most here —
+ * that this is one file you drop into a stock install. So it is asked for
+ * politely and the answer is allowed to be nothing.
+ */
+async function version(): Promise<string | undefined> {
+  // Held in a variable so the specifier stays out of the module graph: written
+  // inline it would be a compile-time dependency of a file that deliberately
+  // has none.
+  const specifier = "@opencode-ai/core/installation/version"
+  try {
+    const module: unknown = await import(specifier)
+    return str(record(module)?.["InstallationVersion"])
+  } catch {
+    return undefined
+  }
+}
+
+/** A session-level line, with the fields every one of them carries. */
+function event(type: string, sessionID: string, sess: Session) {
+  return {
+    type,
+    at: new Date().toISOString(),
+    session: sessionID,
+    root_session: sess.id === NO_SESSION ? undefined : sess.id,
+    turn: sess.turns,
+    request_index: sess.requests.get(sessionID),
+  }
+}
+
+/**
+ * The folder a hook's session writes to, opened if this run has not opened it
+ * yet. Same resolution the turns use, so a subagent's tools land in the folder
+ * of the conversation whose work it is doing.
+ */
+function sessionOf(state: State, sessionID: string): Session | undefined {
+  const run = runOf(state)
+  if (!run) return undefined
+  return openSession(state, run, rootOf(state, sessionID))
+}
+
+/** Appends one JSONL line to a file in the session's folder, through the queue. */
+function append(run: Run, sess: Session, file: string, line: Record<string, unknown>) {
+  run.queue = run.queue
+    .then(() => fs.promises.appendFile(path.join(sess.dir, file), JSON.stringify(strip(line)) + "\n"))
+    .catch(() => undefined)
+}
+
+/** Drops the keys whose value is undefined, which `JSON.stringify` keeps as noise. */
+function strip(line: Record<string, unknown>) {
+  const result: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(line)) if (value !== undefined) result[key] = value
+  return result
+}
+
+/**
+ * A config with anything credential-shaped taken out, by the same rule the
+ * headers use. The file is written next to the turns, and a config carries
+ * provider keys.
+ */
+function redactDeep(value: unknown, depth = 0): unknown {
+  if (depth > 12) return value
+  if (Array.isArray(value)) return value.map((item) => redactDeep(item, depth + 1))
+  if (!isRecord(value)) return value
+  const result: Record<string, unknown> = {}
+  for (const [key, child] of Object.entries(value))
+    result[key] = SENSITIVE_NAME.test(key) ? REDACTED : redactDeep(child, depth + 1)
+  return result
 }
 
 function shared(settings: Settings): State {
@@ -540,6 +911,39 @@ function flush(run: Run) {
       }
       sess.pending.clear()
     }
+    // A tool that got its `before` and never its `after` did not finish: it
+    // threw, was denied, or the process left while it was still running.
+    // opencode does not fire the `after` hook on the failing path, so the
+    // absence is the record — without this the call would leave no trace at all,
+    // and a tool that fails constantly would look like a tool nobody calls.
+    for (const [callID, running] of sess.runningTools) {
+      const cost = toolCost(sess, running.tool)
+      cost.runs += 1
+      cost.failed += 1
+      try {
+        fs.appendFileSync(
+          path.join(sess.dir, TOOL_FILE),
+          JSON.stringify(
+            strip({
+              call_id: callID,
+              tool: running.tool,
+              session: running.session,
+              root_session: sess.id === NO_SESSION ? undefined : sess.id,
+              request_index: running.request_index,
+              started_at: new Date(running.started).toISOString(),
+              ms: Date.now() - running.started,
+              args_chars: running.args_chars,
+              args_preview: running.args_preview,
+              ok: false,
+              note: "no completion was recorded: the tool failed, was denied, or was still running when the process exited",
+            }),
+          ) + "\n",
+        )
+      } catch {
+        // Nothing useful to do at exit.
+      }
+    }
+    sess.runningTools.clear()
     try {
       fs.writeFileSync(path.join(sess.dir, "summary.json"), text(summary(sess)))
       // Last, and always: without it the next run would not find this folder,
@@ -614,8 +1018,18 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
 
   // Decoded before the request goes out, so the reuse chain follows the order
   // the turns were sent rather than the order the responses came back.
-  const prompt = readPrompt(request.body)
+  const prompt = readPrompt(request.body, sess.toolNames)
   const reuse = track(sess, turn, sessionID, context, model, prompt)
+  // The request this turn is part of: whatever the user last typed into this
+  // session, and — for a subagent, whose own counter starts at one — the one
+  // that caused the conversation it is doing the work of.
+  const requestIndex = sess.requests.get(sessionID ?? "?")
+  const rootIndex = sess.requests.get(sess.id)
+  // A compaction that has fired since the last turn is charged here: this is
+  // the first prompt written against the rewritten history, so its reuse diff
+  // is the measurement of what the compaction actually threw away.
+  const compacted = sessionID ? sess.pendingCompaction.get(sessionID) : undefined
+  if (sessionID) sess.pendingCompaction.delete(sessionID)
   const sent = {
     method: request.method,
     url: redactUrl(request.url),
@@ -631,6 +1045,9 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
     root_session: sess.id === NO_SESSION ? undefined : sess.id,
     agent: context?.agent,
     started_at: new Date(started).toISOString(),
+    request_index: requestIndex,
+    root_request_index: rootIndex !== requestIndex ? rootIndex : undefined,
+    user_message: sessionID ? sess.messages.get(sessionID) : undefined,
     incomplete: true,
     note: "the process exited while this request was still in flight, so nothing is known about its token usage",
     prompt: view(prompt),
@@ -639,7 +1056,7 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
   })
 
   const write = (
-    result: { response?: unknown; error?: unknown; reply?: Reply },
+    result: { response?: unknown; error?: unknown; reply?: Reply; timing?: Timing },
     reported: Usage | undefined,
     billed = true,
   ) => {
@@ -648,8 +1065,27 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
     const usage = reported ?? (billed ? guess(prompt, result.reply) : undefined)
     const tokens = attribute(prompt, usage)
     const diff = resolveReuse(reuse, tokens)
+    // A prompt sent again byte for byte, after the turn it repeats failed, is a
+    // retry: nothing new was asked and the tokens are being paid a second time.
+    // Every one of them is pure waste, which is why it is worth a field of its
+    // own rather than a turn that merely looks like its neighbour.
+    //
+    // `previous_turn` is the turn this prompt was diffed against, assigned when
+    // the request went out, so the link follows the order things were sent
+    // rather than the order the answers came back.
+    const before = reuse ? sess.outcomes.get(reuse.previous_turn) : undefined
+    const retry = reuse?.identical && before?.failed ? { turn: reuse.previous_turn, status: before.status } : undefined
+    if (retry) {
+      sess.retries += 1
+      sess.retryTokens += usage?.total ?? 0
+    }
+    if (compacted) {
+      sess.compactions += 1
+      if (compacted.overflow) sess.compactionOverflow += 1
+      sess.compactionDropped += droppedTokens(reuse, tokens, prompt)
+    }
     sess.pending.delete(turn)
-    tally(sess, sessionID, context, model, usage, tokens, reuse)
+    tally(sess, sessionID, context, model, usage, tokens, reuse, prompt)
 
     const head: Head = {
       turn,
@@ -670,8 +1106,33 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
         // The conversation this folder is: the same as `session` unless the turn
         // is a subagent's, in which case it is whoever spawned it.
         root_session: sess.id === NO_SESSION ? undefined : sess.id,
+        request_index: requestIndex,
+        root_request_index: rootIndex !== requestIndex ? rootIndex : undefined,
+        user_message: sessionID ? sess.messages.get(sessionID) : undefined,
+        retry_of: retry?.turn,
+        retry_reason: retry ? (retry.status ? `HTTP ${retry.status}` : "the request never returned") : undefined,
+        compaction: compacted
+          ? {
+              ...compacted,
+              dropped_messages: reuse?.dropped_messages,
+              dropped_tokens: droppedTokens(reuse, tokens, prompt),
+            }
+          : undefined,
         usage,
         cache_hit_rate: hitRate(usage),
+        // What a token of each kind cost here, straight from opencode's model
+        // catalog. Not multiplied out: what this turn was worth is the reader's
+        // multiplication to do, and a total frozen into the file would be one
+        // more number to distrust when the catalog moves.
+        rates_per_million: context?.model.cost
+          ? {
+              input: context.model.cost.input,
+              output: context.model.cost.output,
+              cache_read: context.model.cost.cache.read,
+              cache_write: context.model.cost.cache.write,
+            }
+          : undefined,
+        timing: result.timing,
         prompt: tokens?.view ?? view(prompt),
         reuse: diff,
         reply: replyView(result.reply, usage),
@@ -689,6 +1150,9 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
         root_session: sess.id === NO_SESSION ? undefined : sess.id,
         agent: head.agent,
         model: head.model,
+        request_index: requestIndex,
+        retry_of: retry?.turn,
+        compaction: compacted ? true : undefined,
         source: usage?.source,
         input_tokens: usage?.input,
         cache_read_tokens: usage?.cache_read,
@@ -705,6 +1169,7 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
         prefix_stable: reuse?.prefix_stable,
         stop_reason: result.reply?.stop_reason,
         tool_calls: result.reply?.tool_calls.map((call) => call.name).filter(Boolean),
+        first_token_ms: result.timing?.first_token_ms,
         seconds: head.elapsed_seconds,
       },
     )
@@ -712,29 +1177,122 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
 
   try {
     const response = await send()
-    let buffer: Promise<ArrayBuffer | undefined>
+    let read: Promise<{ buffer?: ArrayBuffer; timing?: Timing }>
     try {
-      buffer = response.clone().arrayBuffer().catch(nothing)
+      read = timedBody(response.clone(), started).catch(() => ({}))
     } catch {
-      buffer = Promise.resolve(undefined)
+      read = Promise.resolve({})
     }
     const status = response.status
+    // Recorded here rather than where the turn is written: opencode decides
+    // whether to retry the moment it sees this status, so this is the one point
+    // that is guaranteed to come before the retry is sent. The record itself is
+    // written much later, once the body has been read, and by then several
+    // turns may have overtaken each other.
+    sess.outcomes.set(turn, { failed: status >= 400, status })
+    forget(sess.outcomes, turn)
     const headers = redactHeaders(response.headers)
     const type = response.headers.get("content-type") ?? ""
-    void buffer.then((value) => {
-      const body = describeResponse(type, value, state.settings.raw)
+    void read.then(({ buffer, timing }) => {
+      const body = describeResponse(type, buffer, state.settings.raw)
       const payload = body["events"] ?? body["body"]
       // A rejected request bought nothing. Keep whatever the provider did
       // report, but never invent an estimate for a turn that was not served.
       const served = status < 400
       if (!served) sess.errors += 1
-      write({ response: { status, headers, ...body }, reply: readReply(payload) }, usageOf(payload), served)
+      write(
+        { response: { status, headers, ...body }, reply: readReply(payload), timing },
+        usageOf(payload),
+        served,
+      )
     }, nothing)
     return response
   } catch (error) {
     sess.errors += 1
+    sess.outcomes.set(turn, { failed: true })
+    forget(sess.outcomes, turn)
     write({ error: describeError(error) }, undefined, false)
     throw error
+  }
+}
+
+// Only the recent turns are ever asked about — a retry follows the turn it
+// repeats — so the map is kept short rather than growing for the length of the
+// conversation.
+const OUTCOME_MEMORY = 50
+
+function forget(outcomes: Map<number, unknown>, turn: number) {
+  for (const past of outcomes.keys()) if (past < turn - OUTCOME_MEMORY) outcomes.delete(past)
+}
+
+// Where a stream stops being latency and starts being generation: the first
+// frame that carries a piece of the answer. Matched on the bytes rather than on
+// parsed frames because the point is to know *when* it arrived, and the parse
+// only happens once the whole body is in. Deliberately loose — every dialect
+// spells its delta differently, and being a frame early or late costs a few
+// milliseconds on a number whose interesting range is hundreds.
+const FIRST_TOKEN = /content_block_delta|"delta"\s*:|\.delta"|"candidates"/
+
+/**
+ * The response body, with the clock kept while it arrives.
+ *
+ * The buffered read this replaces resolves only once the stream has ended, so
+ * every moment inside it was lost — and a streamed answer is nearly all inside
+ * it. Reading the clone frame by frame costs one pass over bytes that were
+ * being decoded anyway, and buys the one measurement that separates a slow
+ * provider from a long answer.
+ *
+ * The response handed back to opencode is untouched: this reads a clone.
+ */
+async function timedBody(response: Response, started: number): Promise<{ buffer?: ArrayBuffer; timing?: Timing }> {
+  const body = response.body
+  // No stream to read: a body already in hand, or a runtime that does not
+  // expose one. Fall back to the buffered read, and report no timing rather
+  // than a made-up one.
+  if (!body) return { buffer: await response.arrayBuffer().catch(nothing) }
+
+  const reader = body.getReader()
+  const chunks: Uint8Array[] = []
+  const decoder = new TextDecoder("utf-8", { fatal: false })
+  let size = 0
+  let first: number | undefined
+  let token: number | undefined
+  let last = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (!value?.byteLength) continue
+    const at = Date.now() - started
+    if (first === undefined) first = at
+    last = at
+    chunks.push(value)
+    size += value.byteLength
+    // `stream: true` so a multi-byte character split across two chunks does not
+    // come back as a replacement character and hide the marker behind it.
+    if (token === undefined && FIRST_TOKEN.test(decoder.decode(value, { stream: true }))) token = at
+  }
+
+  const buffer = new Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) {
+    buffer.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return {
+    buffer: buffer.buffer,
+    timing:
+      first === undefined
+        ? undefined
+        : {
+            first_byte_ms: first,
+            // Only meaningful when the answer came in pieces. One chunk is a
+            // response that was assembled before it was sent, and its first
+            // token never had a moment of its own.
+            first_token_ms: chunks.length > 1 ? token : undefined,
+            last_byte_ms: last,
+            stream_ms: last - first,
+            chunks: chunks.length,
+          },
   }
 }
 
@@ -835,6 +1393,18 @@ function openSession(state: State, run: Run, root: string): Session | undefined 
     pieces: storedPieces(found.dir),
     pending: new Map(),
     runs: [...(prior?.runs ?? []), path.basename(run.file)],
+    toolNames: prior?.toolNames ?? new Map(),
+    byTool: prior?.byTool ?? new Map(),
+    runningTools: new Map(),
+    pendingCompaction: new Map(),
+    requests: prior?.requests ?? new Map(),
+    messages: new Map(),
+    outcomes: new Map(),
+    retries: prior?.retries ?? 0,
+    retryTokens: prior?.retryTokens ?? 0,
+    compactions: prior?.compactions ?? 0,
+    compactionOverflow: prior?.compactionOverflow ?? 0,
+    compactionDropped: prior?.compactionDropped ?? 0,
   }
   if (created.id !== NO_SESSION) created.members.add(created.id)
   // The chain this folder learned in earlier runs. Without it, a subagent that
@@ -939,7 +1509,45 @@ function readState(dir: string): Saved | undefined {
     resent: num(data["resent"]),
     breaks: num(data["breaks"]),
     runs: strings(data["runs"]),
+    toolNames: reviveParents(data["tool_names"]),
+    byTool: reviveTools(data["by_tool"]),
+    requests: reviveCounts(data["requests"]),
+    retries: num(data["retries"]),
+    retryTokens: num(data["retry_tokens"]),
+    compactions: num(data["compactions"]),
+    compactionOverflow: num(data["compaction_overflow"]),
+    compactionDropped: num(data["compaction_dropped_tokens"]),
   }
+}
+
+/** The per-tool totals as the last run left them. */
+function reviveTools(value: unknown): Map<string, ToolCost> {
+  const map = new Map<string, ToolCost>()
+  if (!isRecord(value)) return map
+  for (const [name, entry] of Object.entries(value)) {
+    if (!isRecord(entry)) continue
+    map.set(name, {
+      calls: num(entry["calls"]),
+      result_tokens: num(entry["result_tokens"]),
+      result_chars: num(entry["result_chars"]),
+      resent_tokens: num(entry["resent_tokens"]),
+      errors: num(entry["errors"]),
+      runs: num(entry["runs"]),
+      failed: num(entry["failed"]),
+      ms: num(entry["ms"]),
+      ms_max: num(entry["ms_max"]),
+      output_chars: num(entry["output_chars"]),
+    })
+  }
+  return map
+}
+
+/** A map of counters, read back as it was written. */
+function reviveCounts(value: unknown): Map<string, number> {
+  const map = new Map<string, number>()
+  if (!isRecord(value)) return map
+  for (const [key, count] of Object.entries(value)) if (typeof count === "number") map.set(key, count)
+  return map
 }
 
 /** The child -> parent links this folder has seen, as the next run needs them. */
@@ -1056,17 +1664,26 @@ function storedPieces(dir: string) {
 function deflate(value: unknown, sess: Session) {
   const fresh = new Map<string, string>()
   let refs = 0
-  const walk = (item: unknown): unknown => {
-    if (Array.isArray(item)) return item.map(walk)
+  // Only inside the verbatim halves of the record. The `prompt` view next to
+  // them is a list of rows named `messages` too, but it is this turn's
+  // measurement — its token counts differ from every other turn's, so no two
+  // rows ever hash alike and storing them fills the file with entries that can
+  // never be reused. Those rows already carry a `ref` to reach the bytes they
+  // describe; they are the index, not the thing indexed.
+  const walk = (item: unknown, verbatim: boolean): unknown => {
+    if (Array.isArray(item)) return item.map((child) => walk(child, verbatim))
     if (!isRecord(item)) return item
     const result: Record<string, unknown> = {}
-    for (const [key, child] of Object.entries(item))
-      result[key] = PIECE_LIST.has(key) && Array.isArray(child) ? child.map(store) : walk(child)
+    for (const [key, child] of Object.entries(item)) {
+      const inside = verbatim || key === "request" || key === "response"
+      result[key] =
+        inside && PIECE_LIST.has(key) && Array.isArray(child) ? child.map(store) : walk(child, inside)
+    }
     return result
   }
   const store = (piece: unknown) => {
     const serial = safeJson(piece)
-    if (serial.length < PIECE_MIN_CHARS) return walk(piece)
+    if (serial.length < PIECE_MIN_CHARS) return walk(piece, true)
     const id = hash(serial)
     // Registrada aqui, e não quando a fila grava: dois turnos podem passar por
     // aqui antes de a fila rodar, e o segundo reescreveria a mesma linha. A
@@ -1079,7 +1696,7 @@ function deflate(value: unknown, sess: Session) {
     refs += 1
     return { $ref: id }
   }
-  return { record: walk(value) as Record<string, unknown>, fresh, refs }
+  return { record: walk(value, false) as Record<string, unknown>, fresh, refs }
 }
 
 /**
@@ -1161,6 +1778,17 @@ function checkpoint(sess: Session) {
     parents: Object.fromEntries(sess.parents),
     history: Object.fromEntries(sess.history),
     runs: sess.runs,
+    by_tool: Object.fromEntries(sess.byTool),
+    // Only the recent ids: a `tool_result` names a call from the turn before,
+    // never one from a thousand turns ago, and an unbounded map would grow the
+    // checkpoint without ever being read.
+    tool_names: Object.fromEntries([...sess.toolNames].slice(-TOOL_NAME_LIMIT)),
+    requests: Object.fromEntries(sess.requests),
+    retries: sess.retries,
+    retry_tokens: sess.retryTokens,
+    compactions: sess.compactions,
+    compaction_overflow: sess.compactionOverflow,
+    compaction_dropped_tokens: sess.compactionDropped,
   }
 }
 
@@ -1176,6 +1804,7 @@ function tally(
   usage: Usage | undefined,
   tokens: Attributed | undefined,
   reuse: Reuse | undefined,
+  prompt: Prompt | undefined,
 ) {
   if (tokens) {
     sess.prompt.system += tokens.system
@@ -1187,6 +1816,7 @@ function tally(
     sess.resent += resent(reuse, tokens)
     if (!reuse.prefix_stable) sess.breaks += 1
   }
+  chargeTools(sess, prompt, tokens, reuse)
   if (!usage) return
   const name = `${context?.providerID ?? "?"}/${model ?? context?.model.id ?? "?"}`
   for (const target of [
@@ -1196,6 +1826,75 @@ function tally(
     into(sess.bySession, sessionID ?? "?"),
   ])
     accumulate(target, usage)
+}
+
+/**
+ * Charges this turn's prompt to the tools that filled it.
+ *
+ * The split that matters is new against resent, and `reuse` has already drawn
+ * that line: everything below `stable_messages` is history the model has read
+ * before, everything at or above it is what this turn added. So a result is
+ * counted as `result_tokens` on the turn it first appears and as
+ * `resent_tokens` on every turn after — which is the difference between what a
+ * tool cost and what keeping its answer around costs. When the prefix breaks
+ * the line moves back, and the messages behind it are charged as new again:
+ * that is not a miscount, it is what a broken prefix actually does.
+ *
+ * The tokens are the row's, scaled by the share of the row its results occupy,
+ * so a message mixing prose and a tool result does not hand the prose's tokens
+ * to the tool. Like every per-row number here it comes from the proportional
+ * split, exact in aggregate and approximate on one line.
+ */
+function chargeTools(
+  sess: Session,
+  prompt: Prompt | undefined,
+  tokens: Attributed | undefined,
+  reuse: Reuse | undefined,
+) {
+  if (!prompt) return
+  const stable = reuse?.stable_messages ?? 0
+  prompt.messages.forEach((piece, index) => {
+    const fresh = index >= stable
+    if (fresh) for (const call of piece.tool_calls ?? []) toolCost(sess, call.name ?? "?").calls += 1
+    const results = piece.tool_results ?? []
+    if (!results.length) return
+    const rowTokens = tokens?.perMessage[index] ?? est(piece.chars)
+    const resultChars = results.reduce((total, result) => total + result.chars, 0)
+    const share = piece.chars ? Math.min(1, resultChars / piece.chars) : 1
+    const split = distribute(
+      Math.round(rowTokens * share),
+      results.map((result) => result.chars),
+    )
+    results.forEach((result, at) => {
+      const cost = toolCost(sess, result.tool ?? "?")
+      if (!fresh) {
+        cost.resent_tokens += split[at]
+        return
+      }
+      cost.result_tokens += split[at]
+      cost.result_chars += result.chars
+      if (result.error) cost.errors += 1
+    })
+  })
+}
+
+function toolCost(sess: Session, name: string) {
+  const existing = sess.byTool.get(name)
+  if (existing) return existing
+  const created: ToolCost = {
+    calls: 0,
+    result_tokens: 0,
+    result_chars: 0,
+    resent_tokens: 0,
+    errors: 0,
+    runs: 0,
+    failed: 0,
+    ms: 0,
+    ms_max: 0,
+    output_chars: 0,
+  }
+  sess.byTool.set(name, created)
+  return created
 }
 
 function accumulate(target: Bucket, usage: Usage) {
@@ -1245,6 +1944,26 @@ function summary(sess: Session) {
     // Both breakdowns count every turn, estimated ones included.
     by_model: Object.fromEntries([...sess.byModel].map(([name, value]) => [name, shape(value)])),
     by_agent: Object.fromEntries([...sess.byAgent].map(([name, value]) => [name, shape(value)])),
+    // What each tool cost: the tokens its answers took up the first time, what
+    // carrying them since has cost on top, and — when the execution hooks are
+    // in play — the wall clock it spent and how often it failed. The answer to
+    // "where is the context going", which is where a long session's money goes.
+    by_tool: sess.byTool.size
+      ? Object.fromEntries(
+          [...sess.byTool]
+            .sort((a, b) => b[1].result_tokens + b[1].resent_tokens - (a[1].result_tokens + a[1].resent_tokens))
+            .map(([name, cost]) => [name, { ...cost, ms_avg: cost.runs ? Math.round(cost.ms / cost.runs) : undefined }]),
+        )
+      : undefined,
+    // Turns that resent a prompt the provider had already rejected. Pure waste:
+    // every token here was paid for twice or more.
+    retry_turns: sess.retries || undefined,
+    retry_tokens: sess.retryTokens || undefined,
+    // What compaction did, when it ran. `overflow` counts the ones forced by a
+    // context that had already filled, as opposed to the elective ones.
+    compactions: sess.compactions || undefined,
+    compaction_overflow: sess.compactionOverflow || undefined,
+    compaction_dropped_tokens: sess.compactionDropped || undefined,
     // Per conversation filed here: the root, and a row for each subagent it
     // spawned — what the `task` tool actually used, without leaving the folder.
     by_session:
@@ -1274,6 +1993,12 @@ function runSummary(run: Run) {
     started_at: new Date(run.started).toISOString(),
     pid: process.pid,
     cwd: process.cwd(),
+    // Which opencode wrote this, and with what configuration. Two folders are
+    // only comparable when these match — otherwise the difference between them
+    // may be the point rather than the noise.
+    opencode_version: run.version,
+    config_hash: run.configHash,
+    plugin_version: PLUGIN_VERSION,
     requests: run.requests,
     // One folder per session — that is the unit a reader groups by. The counts
     // are the folder's, not this run's: a resumed session brings its history
@@ -1657,12 +2382,12 @@ function replyView(reply: Reply | undefined, usage: Usage | undefined) {
 // Prompt: what the harness sent, decoded out of the provider's dialect.
 // ---------------------------------------------------------------------------
 
-function readPrompt(body: unknown): Prompt | undefined {
+function readPrompt(body: unknown, names?: Map<string, string>): Prompt | undefined {
   if (!isRecord(body)) return undefined
   const dialect = dialectOf(body)
   const system = systemPieces(body, dialect)
   const tools = toolPieces(body, dialect)
-  const messages = messagePieces(body, dialect)
+  const messages = messagePieces(body, dialect, names)
 
   const sum = (pieces: Piece[]) => pieces.reduce((total, piece) => total + piece.chars, 0)
   const systemChars = sum(system)
@@ -1765,7 +2490,7 @@ function toolList(body: Record<string, unknown>, dialect: string): unknown[] {
   return tools.map((tool) => (isRecord(tool) && isRecord(tool["function"]) ? tool["function"] : tool))
 }
 
-function messagePieces(body: Record<string, unknown>, dialect: string): Piece[] {
+function messagePieces(body: Record<string, unknown>, dialect: string, names?: Map<string, string>): Piece[] {
   const list =
     dialect === "gemini"
       ? arrayOf(body["contents"])
@@ -1784,6 +2509,16 @@ function messagePieces(body: Record<string, unknown>, dialect: string): Piece[] 
     const serial = safeStringify(message)
     const body = textOf(content)
     const kinds = kindsOf(content)
+    const { calls, results } = toolRefsOf(value, content, dialect)
+    // The calls of this prompt before its results: within one conversation a
+    // call always goes by in an earlier message than the result answering it,
+    // so one forward pass names every result. The map outlives the turn because
+    // the same result comes back on every turn afterwards, and the call that
+    // named it eventually falls off the end of a compacted history.
+    if (names) {
+      for (const call of calls) if (call.id && call.name) names.set(call.id, call.name)
+      for (const result of results) if (!result.tool && result.id) result.tool = names.get(result.id)
+    }
     pieces.push({
       index: pieces.length,
       role,
@@ -1795,6 +2530,8 @@ function messagePieces(body: Record<string, unknown>, dialect: string): Piece[] 
       ref: refOf(message),
       text: body || undefined,
       stable: stamped(serial),
+      tool_calls: calls.length ? calls : undefined,
+      tool_results: results.length ? results : undefined,
     })
   }
   return pieces
@@ -1818,6 +2555,80 @@ function piece(index: number, value: unknown, extra: Partial<Piece> = {}): Piece
     text: body || undefined,
     stable: stamped(serial),
   }
+}
+
+/**
+ * The tool traffic inside one message: what it asked to run, and what came back.
+ *
+ * `kinds` already says a block is a `tool_result`; what it cannot say is whose.
+ * A result names only the id of the call it answers, and the call that carries
+ * the name went by in an earlier message — so the id is the join, and the whole
+ * point of pulling it out here is that the tokens a result occupies can then be
+ * charged to the tool that produced them.
+ *
+ * Every dialect spells this differently, and Gemini does not spell the id at
+ * all: it repeats the function name on both halves instead, which is enough to
+ * attribute the cost and not enough to tell two concurrent calls of the same
+ * tool apart.
+ */
+function toolRefsOf(message: Record<string, unknown> | undefined, content: unknown, dialect: string) {
+  const calls: NonNullable<Piece["tool_calls"]> = []
+  const results: NonNullable<Piece["tool_results"]> = []
+
+  // OpenAI's chat dialect keeps both halves on the message itself rather than
+  // in a content block, so it is read off the envelope and not the parts.
+  if (dialect === "openai-chat" && message) {
+    for (const call of arrayOf(message["tool_calls"])) {
+      const value = record(call)
+      const fn = record(value?.["function"]) ?? value
+      calls.push({ id: str(value?.["id"]), name: str(fn?.["name"]), chars: sizeOf(fn?.["arguments"]) })
+    }
+    const answered = str(message["tool_call_id"])
+    if (answered) results.push({ id: answered, chars: sizeOf(message["content"]) })
+  }
+
+  const collect = (part: unknown) => {
+    const value = record(part)
+    if (!value) return
+    switch (str(value["type"])) {
+      case "tool_use":
+        calls.push({ id: str(value["id"]), name: str(value["name"]), chars: sizeOf(value["input"]) })
+        return
+      case "tool_result":
+        results.push({
+          id: str(value["tool_use_id"]),
+          chars: sizeOf(value["content"]),
+          error: value["is_error"] === true || undefined,
+        })
+        return
+      // The Responses API, whose items are bare rather than wrapped in content.
+      case "function_call":
+        calls.push({ id: str(value["call_id"]), name: str(value["name"]), chars: sizeOf(value["arguments"]) })
+        return
+      case "function_call_output":
+        results.push({ id: str(value["call_id"]), chars: sizeOf(value["output"]) })
+        return
+    }
+    // Bedrock and Gemini name the block by its key instead of a `type` field.
+    const use = record(value["toolUse"])
+    if (use) calls.push({ id: str(use["toolUseId"]), name: str(use["name"]), chars: sizeOf(use["input"]) })
+    const result = record(value["toolResult"])
+    if (result)
+      results.push({
+        id: str(result["toolUseId"]),
+        chars: sizeOf(result["content"]),
+        error: result["status"] === "error" || undefined,
+      })
+    const fnCall = record(value["functionCall"]) ?? record(value["function_call"])
+    // Gemini has no call id at all: the name is the only handle, on both halves.
+    if (fnCall) calls.push({ name: str(fnCall["name"]), chars: sizeOf(fnCall["args"]) })
+    const fnResult = record(value["functionResponse"]) ?? record(value["function_response"])
+    if (fnResult) results.push({ tool: str(fnResult["name"]), chars: sizeOf(fnResult["response"]) })
+  }
+
+  if (Array.isArray(content)) content.forEach(collect)
+  else collect(content)
+  return { calls, results }
 }
 
 /** The block types inside a message: text, tool_use, tool_result, image, ... */
@@ -1897,7 +2708,7 @@ function track(
   // against each other. Within one folder there is still a chain per session id
   // — a subagent files here but is its own conversation — and per model and
   // dialect, so a small model called for titles does not read as a break.
-  const key = [sessionID ?? "?", model ?? context?.model.id ?? "", prompt.dialect]
+  const key = chainOf(sessionID, context, model, prompt.dialect)
   const next: Fingerprint = {
     turn,
     system: hash(prompt.system.map((piece) => piece.stable).join("\n")),
@@ -1906,8 +2717,8 @@ function track(
     chars: prompt.messages.map((piece) => piece.chars),
     refs: prompt.messages.map((piece) => piece.ref),
   }
-  const previous = sess.history.get(key.join("|"))
-  sess.history.set(key.join("|"), next)
+  const previous = sess.history.get(key)
+  sess.history.set(key, next)
   if (!previous) return undefined
   const diff = compare(previous, next)
   // Saying the prefix broke at index 12 leaves the reading to be done by hand.
@@ -1924,6 +2735,21 @@ function track(
     }
   }
   return diff
+}
+
+/**
+ * Which chain of turns this one belongs to. One per session, model and dialect:
+ * a subagent is its own conversation, and a small model called for a title is
+ * not a break in the coding model's history. Both the reuse diff and the retry
+ * check key off it, so they must agree on what it is.
+ */
+function chainOf(
+  sessionID: string | undefined,
+  context: Context | undefined,
+  model: string | undefined,
+  dialect: string,
+) {
+  return [sessionID ?? "?", model ?? context?.model.id ?? "", dialect].join("|")
 }
 
 function compare(previous: Fingerprint, next: Fingerprint): Reuse {
@@ -1948,8 +2774,14 @@ function compare(previous: Fingerprint, next: Fingerprint): Reuse {
     // True when this turn only appended: everything the provider could have
     // cached is still there, unchanged, in the same order.
     prefix_stable: !systemChanged && !toolsChanged && stable >= previous.messages.length,
+    identical:
+      !systemChanged &&
+      !toolsChanged &&
+      stable === previous.messages.length &&
+      stable === next.messages.length,
     resent_chars: sum(next.chars.slice(0, stable)),
     new_chars: sum(next.chars.slice(stable)),
+    dropped_chars: sum(previous.chars.slice(stable)),
   }
 }
 
@@ -1970,6 +2802,23 @@ function resent(reuse: Reuse, tokens: Attributed | undefined) {
   return tokens.perMessage.slice(0, reuse.stable_messages).reduce((total, value) => total + value, 0)
 }
 
+/**
+ * What a rewritten history threw away, priced in tokens.
+ *
+ * Always an estimate of the discarded side: those messages are gone from this
+ * prompt, so their size comes off the previous turn's fingerprint rather than
+ * off anything the provider counted. They are charged at the rate this turn's
+ * own prompt is being billed at, so the number is in the same currency as the
+ * ones printed next to it — and at the flat ratio when there is no turn with
+ * real counts to calibrate against.
+ */
+function droppedTokens(reuse: Reuse | undefined, tokens: Attributed | undefined, prompt: Prompt | undefined) {
+  if (!reuse?.dropped_chars) return 0
+  const chars = prompt?.totals.messages_chars ?? 0
+  const rate = chars && tokens?.messages ? tokens.messages / chars : 1 / CHARS_PER_TOKEN
+  return Math.round(reuse.dropped_chars * rate)
+}
+
 // ---------------------------------------------------------------------------
 // Reply: the model's output, reassembled from the stream.
 // ---------------------------------------------------------------------------
@@ -1988,7 +2837,12 @@ function readReply(payload: unknown): Reply | undefined {
   return {
     text,
     reasoning,
-    tool_calls: calls.map((call) => ({ name: call.name, arguments: json(call.args), chars: call.args.length })),
+    tool_calls: calls.map((call) => ({
+      id: call.id,
+      name: call.name,
+      arguments: json(call.args),
+      chars: call.args.length,
+    })),
     stop_reason: draft.stop,
     chars: {
       text: text.length,
@@ -2076,6 +2930,7 @@ function absorb(draft: Draft, event: unknown) {
         const target = call(draft, key(use["id"] ?? use["index"] ?? position))
         const fn = record(use["function"]) ?? use
         target.name = str(fn["name"]) ?? target.name
+        target.id = str(use["id"]) ?? target.id
         if (typeof fn["arguments"] === "string") target.args += fn["arguments"]
       })
     }
@@ -2143,9 +2998,12 @@ function absorbBlock(draft: Draft, id: string, block: Record<string, unknown> | 
   }
   if (type === "tool_use" || type === "server_tool_use" || type === "function_call") {
     // Keyed by position, never by the block's own id: the frames that carry the
-    // arguments identify the call by its index in the stream.
+    // arguments identify the call by its index in the stream. The id is kept as
+    // a field instead — it is what the next turn's `tool_result` points back at,
+    // and what the execution record is filed under.
     const target = call(draft, id)
     target.name = str(block["name"]) ?? target.name
+    target.id = str(block["id"] ?? block["call_id"] ?? block["toolUseId"]) ?? target.id
     const input = block["input"] ?? block["arguments"]
     // While streaming, the opening frame carries empty arguments and the real
     // ones arrive as deltas, so never overwrite what is already there.
@@ -2171,7 +3029,7 @@ function absorbBlock(draft: Draft, id: string, block: Record<string, unknown> | 
 function call(draft: Draft, id: string) {
   const existing = draft.calls.get(id)
   if (existing) return existing
-  const created: { name?: string; args: string } = { args: "" }
+  const created: { id?: string; name?: string; args: string } = { args: "" }
   draft.calls.set(id, created)
   return created
 }

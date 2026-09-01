@@ -20,6 +20,7 @@
 // conversation ever sent stays in one place however often you resume it.
 //
 //   <dir>/<timestamp>-<session>/        one conversation, from its first turn
+//   <dir>/<timestamp>-<session>/pieces.jsonl   its prompts, each kept once
 //   <dir>/runs/<timestamp>-<pid>.json   what one process did, as an index
 //   <dir>/latest.json                   where the current process is writing
 //
@@ -46,6 +47,16 @@
 //   request  the verbatim bytes on the wire (method, URL, headers, body)
 //   response status, headers, parsed JSON or SSE events
 //
+// The bulk of that is the conversation, and every turn carries all of it again
+// — the same tool schemas, the same system prompt, the same messages as the
+// turn before — with the providers echoing the tool schemas back inside the
+// response on top. So each piece large enough to be worth it is written once to
+// the folder's `pieces.jsonl` (`{"h":<hash>,"b":<the piece verbatim>}`) and left
+// in the turn as `{"$ref":"<hash>"}`. Nothing is lost: joining the two gives
+// back exactly the record that would otherwise have been written, and a turn
+// that uses the store says so in its `pieces` field. Over a real folder it is
+// the difference between 194 KB and 25 KB per turn.
+//
 // About the token counts. `usage` is normalized onto one shape across the
 // dialects, and `usage.source` says where it came from:
 //
@@ -59,6 +70,11 @@
 // and cache writes kept separate, so `prompt` = input + cache_read +
 // cache_write and `total` = prompt + output. `reasoning` is reported as part of
 // `output`, never added on top of it, because that is how it is billed.
+//
+// A counter the dialect does not report is left out rather than written as
+// zero: a model with no prompt cache and a cache that missed are opposite
+// findings, and a `0` cannot tell them apart. The running totals in
+// `summary.json` keep every counter, because there a zero is a sum.
 //
 // Because the provider only gives one number for the whole prompt, the per-part
 // token counts are that number distributed across the parts in proportion to
@@ -89,7 +105,8 @@
 // model id, used to attribute and label each turn.
 //
 // Credentials in headers and query params are redacted; bodies are stored
-// verbatim, so treat the directory as sensitive.
+// verbatim — in the turn or in the piece store next to it — so treat the
+// directory as sensitive.
 import type { Plugin, PluginOptions } from "@opencode-ai/plugin"
 import { createHash } from "node:crypto"
 import fs from "node:fs"
@@ -157,6 +174,15 @@ const SETTING_KEYS = [
   "metadata",
 ]
 
+// The prompt lists whose elements are worth keeping once and pointing at. The
+// same tool schemas and the same messages come back on every turn of a
+// conversation, and the providers echo them again inside the response, so this
+// one set of names covers both halves of the record.
+const PIECE_LIST = new Set(["system", "tools", "messages", "input", "contents"])
+// Below this a reference costs more than the piece it replaces.
+const PIECE_MIN_CHARS = 200
+const PIECE_FILE = "pieces.jsonl"
+
 // Where the providers put their token counts. Cohere hangs them off `meta`.
 const USAGE_KEY = /^(usage|usage_?metadata|billed_units|token_?usage)$/i
 
@@ -179,17 +205,21 @@ type ModelInfo = {
  */
 type Usage = {
   input: number
-  cache_read: number
-  cache_write: number
+  // Absent when the dialect has no such counter, which is not the same finding
+  // as a zero: one says the model has no prompt cache, the other says the cache
+  // was there and missed. A zero cannot tell them apart, so it is not written.
+  cache_read?: number
+  cache_write?: number
   output: number
-  reasoning: number
+  reasoning?: number
   prompt: number
   total: number
   source: "provider" | "estimated"
   // Counters only some providers report: the cache TTL split, audio and
   // prediction tokens, built-in tool requests, the provider's own total (kept
-  // as reported, to check ours against), and its own cost when it bills in
-  // dollars rather than tokens.
+  // as reported, to check ours against, with `total_mismatch` written whenever
+  // the two disagree), and its own cost when it bills in dollars rather than
+  // tokens.
   details?: Record<string, number>
 }
 
@@ -221,6 +251,13 @@ type Piece = {
   schema_chars?: number
   cache?: string
   preview?: string
+  // Where the message is in the folder's store, when it was big enough to go
+  // there — the row and the bytes it describes join on this. Only messages
+  // carry it: a tool row describes the schema unwrapped out of its envelope,
+  // and a system row the content lifted out of its message, so neither is the
+  // list element the store holds, and a reference that resolves to nothing
+  // would be worse than none.
+  ref?: string
   text?: string
   // Hash of the piece with the cache markers removed, for the reuse diff.
   stable?: string
@@ -264,6 +301,9 @@ type Fingerprint = {
   tools: string
   messages: string[]
   chars: number[]
+  // Store references for the same messages, so a diff can point at the two
+  // versions of the message that broke the prefix instead of only saying where.
+  refs: (string | undefined)[]
 }
 
 type Reuse = {
@@ -277,6 +317,9 @@ type Reuse = {
   prefix_stable: boolean
   resent_chars: number
   new_chars: number
+  // The message the prefix broke on: what it is, and where to read both
+  // versions of it. The first thing to look at when the cache stops hitting.
+  changed_piece?: { index: number; role?: string; preview?: string; before?: string; after?: string }
 }
 
 type Reply = {
@@ -352,6 +395,9 @@ type Session = {
   prompt: { system: number; tools: number; messages: number; total: number }
   resent: number
   breaks: number
+  // The pieces already in this folder's store, by hash. What is here is what
+  // the next turn can point at instead of writing again.
+  pieces: Set<string>
   // Turns whose response had not landed yet. A request still in flight when the
   // process exits would otherwise leave no trace at all.
   pending: Map<number, Record<string, unknown>>
@@ -471,7 +517,10 @@ function flush(run: Run) {
       sess.incomplete = sess.pending.size
       for (const [turn, record] of sess.pending) {
         try {
-          fs.writeFileSync(turnPath(sess, turn), text(record))
+          const { record: deflated, fresh, refs } = deflate(record, sess)
+          if (refs) deflated["pieces"] = PIECE_FILE
+          if (fresh.size) fs.appendFileSync(path.join(sess.dir, PIECE_FILE), pieceLines(fresh))
+          fs.writeFileSync(turnPath(sess, turn), text(deflated))
           fs.appendFileSync(
             path.join(sess.dir, "turns.jsonl"),
             JSON.stringify({
@@ -783,6 +832,7 @@ function openSession(state: State, run: Run, root: string): Session | undefined 
     prompt: prior?.prompt ?? { system: 0, tools: 0, messages: 0, total: 0 },
     resent: prior?.resent ?? 0,
     breaks: prior?.breaks ?? 0,
+    pieces: storedPieces(found.dir),
     pending: new Map(),
     runs: [...(prior?.runs ?? []), path.basename(run.file)],
   }
@@ -935,6 +985,9 @@ function reviveHistory(value: unknown): Map<string, Fingerprint> {
       tools: entry["tools"],
       messages: strings(entry["messages"]),
       chars: entry["chars"].map(num),
+      // Absent in a folder written before the store existed: the diff then says
+      // where the prefix broke, just not where to read it.
+      refs: Array.isArray(entry["refs"]) ? entry["refs"].map((item) => str(item)) : [],
     })
   }
   return map
@@ -966,6 +1019,86 @@ function short(id: string) {
   return id.replace(/^ses_/, "").slice(0, 10) || NO_SESSION
 }
 
+/**
+ * The hashes a folder's store already holds.
+ *
+ * Read off the file rather than out of `state.json`, because the set is a
+ * promise that a reference can be resolved: a state file that is newer than the
+ * store — or a store someone trimmed by hand — would make it a lie, and the
+ * turn that trusted it would point at nothing.
+ */
+function storedPieces(dir: string) {
+  const found = new Set<string>()
+  try {
+    const lines = fs.readFileSync(path.join(dir, PIECE_FILE), "utf8")
+    for (const match of lines.matchAll(/^\{"h":"([0-9a-f]+)"/gm)) found.add(match[1])
+  } catch {
+    // No store yet, or one that cannot be read: every piece is written again,
+    // which costs space and is never wrong.
+  }
+  return found
+}
+
+/**
+ * The record with its bulk moved to the store.
+ *
+ * Every turn of a conversation carries the whole conversation — the same tool
+ * schemas, the same system prompt, the same messages as the turn before, plus
+ * whatever is new — and the providers echo the tool schemas back inside the
+ * response on top of that. Written out whole, one turn of a long session runs to
+ * hundreds of kilobytes of text that is already on disk a dozen times over.
+ *
+ * So each list element big enough to be worth it is written once to
+ * `pieces.jsonl` and left in the record as `{"$ref": <hash>}`. Nothing is lost:
+ * the piece is stored verbatim, and joining the two gives back exactly the
+ * record that would have been written.
+ */
+function deflate(value: unknown, sess: Session) {
+  const fresh = new Map<string, string>()
+  let refs = 0
+  const walk = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(walk)
+    if (!isRecord(item)) return item
+    const result: Record<string, unknown> = {}
+    for (const [key, child] of Object.entries(item))
+      result[key] = PIECE_LIST.has(key) && Array.isArray(child) ? child.map(store) : walk(child)
+    return result
+  }
+  const store = (piece: unknown) => {
+    const serial = safeJson(piece)
+    if (serial.length < PIECE_MIN_CHARS) return walk(piece)
+    const id = hash(serial)
+    // Registrada aqui, e não quando a fila grava: dois turnos podem passar por
+    // aqui antes de a fila rodar, e o segundo reescreveria a mesma linha. A
+    // peça e o turno que a cita vão no mesmo bloco da fila — ou entram os dois,
+    // ou não entra nenhum.
+    if (!sess.pieces.has(id)) {
+      fresh.set(id, serial)
+      sess.pieces.add(id)
+    }
+    refs += 1
+    return { $ref: id }
+  }
+  return { record: walk(value) as Record<string, unknown>, fresh, refs }
+}
+
+/**
+ * The hash a piece will have in the store, by the same rule `deflate` uses, so
+ * a row written now can be joined to bytes written later. Undefined for a piece
+ * small enough to stay inline, which is then simply not in the store.
+ */
+function refOf(piece: unknown) {
+  const serial = safeJson(piece)
+  return serial.length < PIECE_MIN_CHARS ? undefined : hash(serial)
+}
+
+/** The store lines for the pieces this turn is the first to mention. */
+function pieceLines(fresh: Map<string, string>) {
+  let out = ""
+  for (const [id, serial] of fresh) out += `{"h":"${id}","b":${serial}}\n`
+  return out
+}
+
 function persist(
   run: Run,
   sess: Session,
@@ -973,9 +1106,14 @@ function persist(
   body: Record<string, unknown>,
   index: Record<string, unknown>,
 ) {
+  const { record, fresh, refs } = deflate(body, sess)
+  if (refs) record["pieces"] = PIECE_FILE
   run.queue = run.queue
     .then(async () => {
-      await fs.promises.writeFile(turnPath(sess, turn), text(body))
+      // The pieces before the turn that names them, always: a reference to a
+      // line that is not there yet is a record that cannot be read.
+      if (fresh.size) await fs.promises.appendFile(path.join(sess.dir, PIECE_FILE), pieceLines(fresh))
+      await fs.promises.writeFile(turnPath(sess, turn), text(record))
       await fs.promises.appendFile(path.join(sess.dir, "turns.jsonl"), JSON.stringify(index) + "\n")
       await fs.promises.writeFile(path.join(sess.dir, "summary.json"), text(summary(sess)))
       await fs.promises.writeFile(path.join(sess.dir, "state.json"), text(checkpoint(sess)))
@@ -1163,11 +1301,11 @@ function shape(value: Bucket) {
   return {
     turns: value.turns,
     input: usage.input,
-    cache_read: usage.cache_read,
-    cache_write: usage.cache_write,
+    cache_read: usage.cache_read ?? 0,
+    cache_write: usage.cache_write ?? 0,
     prompt: usage.prompt,
     output: usage.output,
-    reasoning: usage.reasoning,
+    reasoning: usage.reasoning ?? 0,
     total: usage.total,
     cache_hit_rate: hitRate(usage),
     details: usage.details && Object.keys(usage.details).length ? usage.details : undefined,
@@ -1239,7 +1377,16 @@ function normalize(value: Record<string, unknown>): Usage | undefined {
   const outputDetails = record(value["output_tokens_details"]) ?? record(value["completion_tokens_details"]) ?? {}
   const creation = record(value["cache_creation"]) ?? {}
 
-  const inclusive = num(inputDetails["cached_tokens"]) + num(value["cachedContentTokenCount"])
+  // The cache counters the prompt total already contains. Read is named three
+  // ways (`cached_tokens` nested, the same name at the top level on Moonshot,
+  // `cachedContentTokenCount` on Google) and never twice at once, so the two
+  // spellings of the same number are taken as alternatives rather than summed.
+  // Write only shows up nested, on the dialects that fold it into the prompt.
+  const cachedRead =
+    Math.max(num(inputDetails["cached_tokens"]), num(value["cached_tokens"])) +
+    num(value["cachedContentTokenCount"])
+  const cachedWrite = num(inputDetails["cache_write_tokens"]) + num(inputDetails["cache_creation_input_tokens"])
+  const inclusive = cachedRead + cachedWrite
   const prompt =
     num(value["input_tokens"]) +
     num(value["inputTokens"]) +
@@ -1249,26 +1396,49 @@ function normalize(value: Record<string, unknown>): Usage | undefined {
   const write1h = num(creation["ephemeral_1h_input_tokens"])
   const thoughts = num(value["thoughtsTokenCount"])
 
+  // Whether this dialect counts cache and thinking at all. A counter it never
+  // reports is left out of the record rather than written as zero.
+  const counts = (...items: unknown[]) => items.some((item) => typeof item === "number")
+  const cached = counts(
+    inputDetails["cached_tokens"],
+    value["cached_tokens"],
+    value["cachedContentTokenCount"],
+    value["cache_read_input_tokens"],
+    value["cacheReadInputTokens"],
+    value["cache_creation_input_tokens"],
+    value["cacheWriteInputTokens"],
+    inputDetails["cache_write_tokens"],
+    inputDetails["cache_creation_input_tokens"],
+    creation["ephemeral_5m_input_tokens"],
+    creation["ephemeral_1h_input_tokens"],
+  )
+  const thinks = counts(outputDetails["reasoning_tokens"], value["reasoning_tokens"], value["thoughtsTokenCount"])
+  const cacheRead = cachedRead + num(value["cache_read_input_tokens"]) + num(value["cacheReadInputTokens"])
+  // The same number under three conventions — the top-level counter, the TTL
+  // split beside it, and the nested one already inside the prompt total — so the
+  // largest, not the sum. Adding them would bill one write twice.
+  const cacheWrite = Math.max(
+    num(value["cache_creation_input_tokens"]) + num(value["cacheWriteInputTokens"]),
+    write5m + write1h,
+    cachedWrite,
+  )
+
   const usage: Usage = {
     // Gemini bills the prompt its built-in tools generate on top of the prompt.
     input: Math.max(0, prompt - inclusive) + num(value["toolUsePromptTokenCount"]),
-    cache_read: inclusive + num(value["cache_read_input_tokens"]) + num(value["cacheReadInputTokens"]),
-    cache_write: Math.max(
-      num(value["cache_creation_input_tokens"]) + num(value["cacheWriteInputTokens"]),
-      write5m + write1h,
-    ),
+    ...(cached ? { cache_read: cacheRead, cache_write: cacheWrite } : {}),
     output:
       num(value["output_tokens"]) +
       num(value["outputTokens"]) +
       num(value["completion_tokens"]) +
       num(value["candidatesTokenCount"]) +
       thoughts,
-    reasoning: num(outputDetails["reasoning_tokens"]) + num(value["reasoning_tokens"]) + thoughts,
+    ...(thinks ? { reasoning: num(outputDetails["reasoning_tokens"]) + num(value["reasoning_tokens"]) + thoughts } : {}),
     prompt: 0,
     total: 0,
     source: "provider",
   }
-  usage.prompt = usage.input + usage.cache_read + usage.cache_write
+  usage.prompt = usage.input + (usage.cache_read ?? 0) + (usage.cache_write ?? 0)
   usage.total = usage.prompt + usage.output
   if (usage.total === 0) return undefined
 
@@ -1285,41 +1455,57 @@ function normalize(value: Record<string, unknown>): Usage | undefined {
   note("rejected_prediction", num(outputDetails["rejected_prediction_tokens"]))
   for (const [key, amount] of Object.entries(record(value["server_tool_use"]) ?? {})) note(key, num(amount))
   // Kept as reported, so a disagreement with the total above is visible rather
-  // than smoothed over.
-  note(
-    "reported_total",
-    num(value["total_tokens"]) + num(value["totalTokens"]) + num(value["totalTokenCount"]),
-  )
+  // than smoothed over — and the disagreement itself is written down, because a
+  // counter this dialect reports and we do not read is exactly what it looks
+  // like, and nobody finds it by reading the two numbers side by side.
+  const reported = num(value["total_tokens"]) + num(value["totalTokens"]) + num(value["totalTokenCount"])
+  note("reported_total", reported)
+  note("total_mismatch", reported ? reported - usage.total : 0)
   // Gateways that bill in money rather than tokens (OpenRouter) report it here.
   note("provider_cost", num(value["cost"]))
   if (Object.keys(details).length) usage.details = details
   return usage
 }
 
-/** The fallback for a turn the provider reported nothing about. */
+/**
+ * The fallback for a turn the provider reported nothing about. The cache
+ * counters stay out: nothing was reported, so nothing is known, and a zero here
+ * would read as a cache that missed.
+ */
 function guess(prompt: Prompt | undefined, reply: Reply | undefined): Usage | undefined {
   if (!prompt) return undefined
-  const usage = zero("estimated")
-  usage.input = est(prompt.totals.chars)
-  usage.output = est(reply?.chars.total ?? 0)
-  usage.reasoning = est(reply?.chars.reasoning ?? 0)
-  usage.prompt = usage.input
-  usage.total = usage.prompt + usage.output
+  const input = est(prompt.totals.chars)
+  const output = est(reply?.chars.total ?? 0)
+  const reasoning = est(reply?.chars.reasoning ?? 0)
+  const usage: Usage = {
+    input,
+    output,
+    ...(reasoning ? { reasoning } : {}),
+    prompt: input,
+    total: input + output,
+    source: "estimated",
+  }
   return usage.total ? usage : undefined
 }
 
-/** Share of the prompt the provider served from cache rather than reading anew. */
+/**
+ * Share of the prompt the provider served from cache rather than reading anew.
+ * Undefined when the dialect reports no cache at all — a model without a prompt
+ * cache has no hit rate, and showing it 0% would read as one that never hits.
+ */
 function hitRate(usage: Usage | undefined) {
-  if (!usage || !usage.prompt) return undefined
+  if (!usage || !usage.prompt || usage.cache_read === undefined) return undefined
   return round(usage.cache_read / usage.prompt)
 }
 
+// The buckets keep every counter, zeros included: a bucket mixes models, so a
+// zero there is a sum and not the absence a turn's own record would mean.
 function add(target: Usage, value: Usage) {
   target.input += value.input
-  target.cache_read += value.cache_read
-  target.cache_write += value.cache_write
+  target.cache_read = (target.cache_read ?? 0) + (value.cache_read ?? 0)
+  target.cache_write = (target.cache_write ?? 0) + (value.cache_write ?? 0)
   target.output += value.output
-  target.reasoning += value.reasoning
+  target.reasoning = (target.reasoning ?? 0) + (value.reasoning ?? 0)
   target.prompt += value.prompt
   target.total += value.total
   if (!value.details) return
@@ -1440,7 +1626,7 @@ function replyView(reply: Reply | undefined, usage: Usage | undefined) {
   // number. Anthropic folds it into `output` without breaking it out, so its
   // share is split by size along with everything else rather than silently
   // landing on the prose.
-  const counted = measured ? Math.min(usage.reasoning, usage.output) : 0
+  const counted = measured ? Math.min(usage.reasoning ?? 0, usage.output) : 0
   const budget = Math.max(0, measured ? usage.output - counted : est(reply.chars.total))
   const [textTokens, reasoningTokens, callTokens] = distribute(budget, [
     reply.chars.text,
@@ -1606,6 +1792,7 @@ function messagePieces(body: Record<string, unknown>, dialect: string): Piece[] 
       binary: kinds.some((kind) => BINARY_KIND.test(kind)) || undefined,
       cache: cacheOf(serial),
       preview: preview(body),
+      ref: refOf(message),
       text: body || undefined,
       stable: stamped(serial),
     })
@@ -1717,11 +1904,26 @@ function track(
     tools: hash(prompt.tools.map((piece) => piece.stable).join("\n")),
     messages: prompt.messages.map((piece) => piece.stable ?? ""),
     chars: prompt.messages.map((piece) => piece.chars),
+    refs: prompt.messages.map((piece) => piece.ref),
   }
   const previous = sess.history.get(key.join("|"))
   sess.history.set(key.join("|"), next)
   if (!previous) return undefined
-  return compare(previous, next)
+  const diff = compare(previous, next)
+  // Saying the prefix broke at index 12 leaves the reading to be done by hand.
+  // Naming the message, and pointing at both versions of it in the store, is
+  // the answer to "why did the cache stop hitting" rather than the start of it.
+  if (diff.changed_at !== null) {
+    const piece = prompt.messages[diff.changed_at]
+    diff.changed_piece = {
+      index: diff.changed_at,
+      role: piece?.role,
+      preview: piece?.preview,
+      before: previous.refs?.[diff.changed_at],
+      after: next.refs[diff.changed_at],
+    }
+  }
+  return diff
 }
 
 function compare(previous: Fingerprint, next: Fingerprint): Reuse {
@@ -1998,8 +2200,16 @@ function describeResponse(type: string, buffer: ArrayBuffer | undefined, raw: bo
   const bytes = buffer.byteLength
   if (type && !TEXT_CONTENT.test(type) && !type.includes("event-stream")) return { bytes, encoding: "binary" }
   const body = new TextDecoder().decode(buffer)
-  if (type.includes("event-stream") || body.startsWith("data:") || body.startsWith("event:"))
-    return { bytes, events: sse(body), ...(raw ? { raw: body } : {}) }
+  if (type.includes("event-stream") || body.startsWith("data:") || body.startsWith("event:")) {
+    const events = sse(body)
+    // `raw` is the same bytes a second time whenever the frames parsed, and a
+    // stream is the biggest thing in the record — so it is kept only when it
+    // says something they do not: a frame that came back as a string is one the
+    // parser could not read. The setting forces it for whoever wants the wire
+    // bytes anyway, and doubles the record when they do.
+    const lost = !events.length || events.some((event) => typeof event === "string")
+    return { bytes, events, ...(lost || raw ? { raw: body } : {}) }
+  }
   return { bytes, body: json(body) }
 }
 
@@ -2108,6 +2318,15 @@ function safeStringify(value: unknown) {
     return JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? String(item) : item)) ?? ""
   } catch {
     return "<unserializable>"
+  }
+}
+
+/** A piece as it goes into the store: valid JSON for any value, always. */
+function safeJson(value: unknown) {
+  try {
+    return JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? String(item) : item)) ?? "null"
+  } catch {
+    return "null"
   }
 }
 

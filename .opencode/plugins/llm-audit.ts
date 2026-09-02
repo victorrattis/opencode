@@ -123,7 +123,8 @@
 // The hooks supply what the wire does not carry, and none of them writes to its
 // `output`, so arming the audit cannot change what opencode does:
 //
-//   chat.params    session, agent and model id, to attribute and label a turn
+//   chat.params    session, agent, model id and reasoning variant, to attribute
+//                  and label a turn
 //   chat.message   the user typed something: the boundary `request_index` counts
 //   tool.execute.*  what running a tool cost in wall clock, and whether it
 //                  failed at all — a `before` with no `after` is the failure,
@@ -292,6 +293,10 @@ type Context = {
   agent: string
   providerID: string
   model: ModelInfo
+  // Which reasoning variant of the model was asked for: "high", "max", "none",
+  // and so on, or "default" when none was chosen. The same model id at two
+  // efforts is not the same model to compare, so the turn has to say which.
+  variant: string
 }
 
 // One decoded piece of the prompt: a system block, a tool schema, or a message.
@@ -438,6 +443,7 @@ type Head = {
   turn: number
   provider: string | undefined
   model: string | undefined
+  variant: string | undefined
   session: string | undefined
   agent: string | undefined
   started_at: string
@@ -648,6 +654,7 @@ export const LLMAuditPlugin: Plugin = async (_input, options) => {
         agent: input.agent,
         providerID: input.model.providerID,
         model: input.model,
+        variant: variantOf(input.message),
       }
       state.contexts.set(context.sessionID, context)
       state.byModel.set(context.model.id, context)
@@ -806,6 +813,26 @@ function event(type: string, sessionID: string, sess: Session) {
     turn: sess.turns,
     request_index: sess.requests.get(sessionID),
   }
+}
+
+/**
+ * The reasoning variant the user message asked for, or "default" when it asked
+ * for none.
+ *
+ * Read structurally rather than off the type: the generated `UserMessage` still
+ * declares `model` as `{providerID, modelID}` while the session fills in a third
+ * field, so the property exists at runtime and not in the SDK's idea of it. The
+ * same reason `ModelInfo` above is declared locally.
+ *
+ * "default" is written rather than left absent, and the two are not the same
+ * finding: it says a variant was resolved and it was none, where a missing field
+ * says the log predates this being recorded at all. A reader that cannot tell
+ * them apart would report every old turn as running at default effort.
+ */
+function variantOf(message: unknown): string {
+  const model = isRecord(message) ? message["model"] : undefined
+  const variant = isRecord(model) ? model["variant"] : undefined
+  return typeof variant === "string" && variant ? variant : "default"
 }
 
 /**
@@ -1040,6 +1067,7 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
     turn,
     provider: context?.providerID ?? hostOf(request.url),
     model: model ?? context?.model.id,
+    variant: context?.variant,
     session: sessionID,
     parent_session: parent,
     root_session: sess.id === NO_SESSION ? undefined : sess.id,
@@ -1091,6 +1119,7 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
       turn,
       provider: context?.providerID ?? hostOf(request.url),
       model: model ?? context?.model.id,
+      variant: context?.variant,
       session: sessionID,
       agent: context?.agent,
       started_at: new Date(started).toISOString(),
@@ -1818,7 +1847,12 @@ function tally(
   }
   chargeTools(sess, prompt, tokens, reuse)
   if (!usage) return
-  const name = `${context?.providerID ?? "?"}/${model ?? context?.model.id ?? "?"}`
+  // The variant is part of the name, not a detail of it: the same model at two
+  // reasoning efforts spends differently and answers differently, so summing the
+  // two into one row hides exactly the comparison the row exists to make.
+  const name =
+    `${context?.providerID ?? "?"}/${model ?? context?.model.id ?? "?"}` +
+    ` · ${context?.variant ?? "default"}`
   for (const target of [
     usage.source === "provider" ? sess.reported : sess.estimated,
     into(sess.byModel, name),

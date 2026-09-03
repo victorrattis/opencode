@@ -1107,10 +1107,13 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
       sess.retries += 1
       sess.retryTokens += usage?.total ?? 0
     }
+    // Measured once: the same number is charged to the session total and written
+    // onto the turn, so the two can never disagree about what a rewrite cost.
+    const dropped = compacted ? droppedTokens(reuse, tokens, prompt) : undefined
     if (compacted) {
       sess.compactions += 1
       if (compacted.overflow) sess.compactionOverflow += 1
-      sess.compactionDropped += droppedTokens(reuse, tokens, prompt)
+      sess.compactionDropped += dropped ?? 0
     }
     sess.pending.delete(turn)
     tally(sess, sessionID, context, model, usage, tokens, reuse, prompt)
@@ -1144,7 +1147,14 @@ async function capture(state: State, request: ReturnType<typeof describeRequest>
           ? {
               ...compacted,
               dropped_messages: reuse?.dropped_messages,
-              dropped_tokens: droppedTokens(reuse, tokens, prompt),
+              dropped_tokens: dropped,
+              // The counters above are absent when the diff could not be taken.
+              // Saying why beats leaving a reader to conclude from two missing
+              // fields that the rewrite threw nothing away.
+              not_measured:
+                dropped === undefined
+                  ? "no previous turn to diff against: the reuse chain restarts on a change of model or dialect, and this turn is the first of a new one"
+                  : undefined,
             }
           : undefined,
         usage,
@@ -2845,9 +2855,15 @@ function resent(reuse: Reuse, tokens: Attributed | undefined) {
  * own prompt is being billed at, so the number is in the same currency as the
  * ones printed next to it — and at the flat ratio when there is no turn with
  * real counts to calibrate against.
+ *
+ * `undefined` when there is no previous turn to diff against — the chain is
+ * per session, model and dialect, so switching model on the very turn that
+ * carries the compaction restarts it. Not the same finding as a compaction
+ * that discarded nothing, and a `0` cannot tell the two apart.
  */
 function droppedTokens(reuse: Reuse | undefined, tokens: Attributed | undefined, prompt: Prompt | undefined) {
-  if (!reuse?.dropped_chars) return 0
+  if (!reuse) return undefined
+  if (!reuse.dropped_chars) return 0
   const chars = prompt?.totals.messages_chars ?? 0
   const rate = chars && tokens?.messages ? tokens.messages / chars : 1 / CHARS_PER_TOKEN
   return Math.round(reuse.dropped_chars * rate)
